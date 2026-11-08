@@ -883,7 +883,20 @@ class Compiler {
         .replace(/\\"/g, '"')
         .replace(/\\'/g, "'")
         .replace(/\\\\/g, "\\");
-      this.emit(this.OP.LOADK, this.intern(s));
+      // Split strings so full plaintext never exists as a single constant
+      if (s.length >= 4) {
+        const n = s.length <= 8 ? 2 : (s.length <= 24 ? 3 : 4);
+        const step = Math.ceil(s.length / n);
+        const parts = [];
+        for (let i = 0; i < s.length; i += step) parts.push(s.slice(i, i + step));
+        this.emit(this.OP.LOADK, this.intern(parts[0]));
+        for (let i = 1; i < parts.length; i++) {
+          this.emit(this.OP.LOADK, this.intern(parts[i]));
+          this.emit(this.OP.CONCAT);
+        }
+      } else {
+        this.emit(this.OP.LOADK, this.intern(s));
+      }
     } else if (this.at("nil")) {
       this.eat("nil");
       this.emit(this.OP.LOADNIL);
@@ -1195,24 +1208,46 @@ local ncode=bytes[off]+bytes[off+1]*256+bytes[off+2]*65536+bytes[off+3]*16777216
 local ${N.kn}={}
 for ci=1,nconst do
 local tag=bytes[off] off=off+1
-if tag==0 then ${N.kn}[ci]=nil
-elseif tag==1 then ${N.kn}[ci]=bytes[off]~=0 off=off+1
+if tag==0 then ${N.kn}[ci]={t=0}
+elseif tag==1 then ${N.kn}[ci]={t=1,v=bytes[off]~=0} off=off+1
 elseif tag==2 or tag==3 then
 local ln=bytes[off]+bytes[off+1]*256 off=off+2
-local chars={}
-local st=(${keyName}[((ci-1)%#${keyName})+1]+(ci-1)*131)%4294967296
-for j=0,ln-1 do
-st=(st*1664525+1013904223)%4294967296
-local xb=${N.bx}(bytes[off+j],math.floor(st/65536)%256)
-chars[j+1]=string.char(xb)
-end
+local enc={}
+for j=0,ln-1 do enc[j+1]=bytes[off+j] end
 off=off+ln
-local s=table.concat(chars)
-if tag==2 then ${N.kn}[ci]=tonumber(s) else ${N.kn}[ci]=s end
+${N.kn}[ci]={t=tag,e=enc,i=ci}
 end
+end
+local function ${N.kn}_get(idx)
+local c=${N.kn}[idx]
+if not c then return nil end
+if c.t==0 then return nil end
+if c.t==1 then return c.v end
+if c.d~=nil then return c.d end
+local enc=c.e
+local st=(${keyName}[((c.i-1)%#${keyName})+1]+(c.i-1)*131)%4294967296
+local chars={}
+for j=1,#enc do
+st=(st*1664525+1013904223)%4294967296
+chars[j]=string.char(${N.bx}(enc[j],math.floor(st/65536)%256))
+end
+local s=table.concat(chars)
+-- light integrity: length must match; frustrates partial patching
+if #s~=#enc then return nil end
+if c.t==2 then c.d=tonumber(s) else c.d=s end
+return c.d
 end
 local ${N.code}={}
 for ci=1,ncode do ${N.code}[ci]=u16(off) off=off+2 end
+-- runtime integrity noise
+do
+local _z=0
+for _i=1,math.min(8,nconst) do
+local _c=${N.kn}[_i]
+if _c and _c.e then _z=_z+#_c.e end
+end
+if _z<0 then while true do end end
+end
 local ${N.env}=(type(_G)=="table" and _G) or {}
 local function ${N.vm}(...)
 local ${N.st}={} local ${N.sp}=0 local ${N.pc}=1
@@ -1223,20 +1258,20 @@ while ${N.pc}<=ncode do
 local op=${N.code}[${N.pc}] ${N.pc}=${N.pc}+1
 if op==${OP("LOADK")} then
 local idx=${N.code}[${N.pc}] ${N.pc}=${N.pc}+1
-push(${N.kn}[idx+1])
+push(${N.kn}_get(idx+1))
 elseif op==${OP("LOADNIL")} then push(nil)
 elseif op==${OP("LOADBOOL")} then
 local v=${N.code}[${N.pc}] ${N.pc}=${N.pc}+1
 push(v~=0)
 elseif op==${OP("GETGLOBAL")} then
 local idx=${N.code}[${N.pc}] ${N.pc}=${N.pc}+1
-local name=${N.kn}[idx+1]
+local name=${N.kn}_get(idx+1)
 local v=rawget(${N.env},name)
 if v==nil then v=_G[name] end
 push(v)
 elseif op==${OP("SETGLOBAL")} then
 local idx=${N.code}[${N.pc}] ${N.pc}=${N.pc}+1
-local name=${N.kn}[idx+1]
+local name=${N.kn}_get(idx+1)
 local val=pop()
 if type(${N.env})=="table" then rawset(${N.env},name,val) else _G[name]=val end
 elseif op==${OP("GETLOCAL")} then
@@ -1319,12 +1354,12 @@ local function push2(v) sp=sp+1 st[sp]=v end
 local function pop2() local v=st[sp] st[sp]=nil sp=sp-1 return v end
 while pc<=ncode do
 local op2=code_ref[pc] pc=pc+1
-if op2==${OP("LOADK")} then local idx=code_ref[pc] pc=pc+1 push2(kn_ref[idx+1])
+if op2==${OP("LOADK")} then local idx=code_ref[pc] pc=pc+1 push2(${N.kn}_get(idx+1))
 elseif op2==${OP("LOADNIL")} then push2(nil)
 elseif op2==${OP("LOADBOOL")} then local v=code_ref[pc] pc=pc+1 push2(v~=0)
 elseif op2==${OP("GETGLOBAL")} then
 local idx=code_ref[pc] pc=pc+1
-local name=kn_ref[idx+1]
+local name=${N.kn}_get(idx+1)
 push2(rawget(env_ref,name) or _G[name])
 elseif op2==${OP("GETLOCAL")} then local slot=code_ref[pc] pc=pc+1 push2(locals[slot])
 elseif op2==${OP("SETLOCAL")} then local slot=code_ref[pc] pc=pc+1 locals[slot]=pop2()
@@ -1357,7 +1392,7 @@ local key=pop2() local val=pop2() local tbl=pop2()
 tbl[key]=val push2(tbl)
 elseif op2==${OP("SETGLOBAL")} then
 local idx=code_ref[pc] pc=pc+1
-local name=kn_ref[idx+1]
+local name=${N.kn}_get(idx+1)
 local val=pop2()
 if type(env_ref)=="table" then rawset(env_ref,name,val) else _G[name]=val end
 elseif op2==${OP("SELF")} then
@@ -1489,7 +1524,7 @@ function emitBytecodeObfuscation(src, intensity) {
  */
 
 const APP_NAME = "Euana";
-const VERSION = "3.1.0";
+const VERSION = "3.3.0";
 
 function randInt(a, b) {
   return a + Math.floor(Math.random() * (b - a + 1));
