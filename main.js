@@ -1083,22 +1083,28 @@ function emitBcVm(blob, alph, pad, keyMat, op) {
   for (const k of ["bx", "dec", "st", "sp", "pc", "kn", "code", "locals", "vm", "env"]) {
     N[k] = randIdent();
   }
-  const { seedStr, saltA, saltB } = keyMat;
+  const { seedStr, saltA, saltB, saltC } = keyMat;
   const keyName = randIdent(12);
   const seedName = randIdent(10);
   const saltNameA = randIdent(8);
   const saltNameB = randIdent(8);
-  // split seed into ASCII fragments; store as hex pairs so file encoding cannot corrupt
-  const seedHex = Buffer.from(seedStr, "utf8").toString("hex"); // only 0-9a-f
-  const nFrag = 3 + randInt(0, 1);
+  const saltNameC = randIdent(8);
+  // Stronger seed splitting (v3.5): more fragments, some reversed, XOR mask
+  const seedHex = Buffer.from(seedStr, "utf8").toString("hex");
+  const nFrag = 4 + randInt(0, 2);
   const fragSize = Math.ceil(seedHex.length / nFrag);
   const seedFrags = [];
+  const fragRev = []; // which fragments are stored reversed
   for (let i = 0; i < seedHex.length; i += fragSize) {
-    seedFrags.push(seedHex.slice(i, i + fragSize));
+    let part = seedHex.slice(i, i + fragSize);
+    const rev = Math.random() < 0.45;
+    if (rev) part = part.split("").reverse().join("");
+    seedFrags.push(part);
+    fragRev.push(rev);
   }
   const fragNames = seedFrags.map(() => randIdent(7));
-  const maskName = randIdent(7); // unused, keep for template compat
-  const seedMask = 0;
+  const maskName = randIdent(7);
+  const seedMask = randInt(0x11, 0xee);
   function escLuaStr(s) {
     return s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
   }
@@ -1111,22 +1117,29 @@ function emitBcVm(blob, alph, pad, keyMat, op) {
       `(${num(a)}+${num(b)})%4294967296`,
       `(${num(n ^ 0xffff)}~${num(0xffff)})%4294967296`,
       `(${num(Math.floor(n/3))}*3+${num(n%3)})%4294967296`,
+      `(${num(n ^ 0xa5a5)}~${num(0xa5a5)})%4294967296`,
     ];
     return forms[randInt(0, forms.length - 1)];
   }
   const cMul = opaqueConst(1664525);
   const cAdd = opaqueConst(1013904223);
   const cXor = opaqueConst(0xa5a5a5a5);
+  const cPhi = opaqueConst(0x9e3779b9);
 
   let eq = "=";
   while (blob.includes("]" + eq + "]")) eq += "=";
   const payload = `[${eq}[${blob}]${eq}]`;
   const alphEsc = alph.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-  // map real op names to random idents (no OP_LOADK leaks)
+  // map real op names to random idents + opaque expressions (harder static mapping)
   const opId = {};
   for (const k of Object.keys(op)) opId[k] = randIdent(8);
   const opLocals = Object.entries(op)
-    .map(([k, v]) => `local ${opId[k]}=${num(v)}`)
+    .map(([k, v]) => {
+      // encode opcode value with opaque arithmetic
+      const a = randInt(50, 400);
+      const b = (v - a) >>> 0;
+      return `local ${opId[k]}=(${num(a)}+${num(b)})%256`;
+    })
     .join("\n");
   const OP = (k) => opId[k]; // helper for template
 
@@ -1138,12 +1151,22 @@ function emitBcVm(blob, alph, pad, keyMat, op) {
     `if select("#",1,2)~=2 then while true do end end`,
     `if (1==1)==false then while true do end end`,
     `if type(type)~="function" then while true do end end`,
+    `if type(rawget)~="function" or type(rawset)~="function" then while true do end end`,
   ];
   for (let i = antiParts.length - 1; i > 0; i--) {
     const j = randInt(0, i);
     [antiParts[i], antiParts[j]] = [antiParts[j], antiParts[i]];
   }
-  const anti = antiParts.slice(0, 3 + randInt(0, 2)).join("\n") + "\n";
+  const anti = antiParts.slice(0, 4 + randInt(0, 2)).join("\n") + "\n";
+
+  // Build fragment reconstruction with reverse handling
+  const fragDecls = fragNames.map((fn, i) => `local ${fn}="${escLuaStr(seedFrags[i])}"`).join("\n");
+  const fragReconstruct = fragNames.map((fn, i) => {
+    if (fragRev[i]) {
+      return `local _r${i}=${fn}; ${fn}=""; for _i=#_r${i},1,-1 do ${fn}=${fn}.._r${i}:sub(_i,_i) end`;
+    }
+    return `-- frag ${i}`;
+  }).filter(s => !s.startsWith("--")).join("\n");
 
   let body = `
 return (function(...)
@@ -1182,8 +1205,10 @@ local ${randIdent(8)}={${[...Array(16)].map(()=>num(randInt(0,255))).join(",")}}
 local ${randIdent(8)}={${[...Array(16)].map(()=>num(randInt(0,255))).join(",")}}
 local ${saltNameA}=${num(saltA)}
 local ${saltNameB}=${num(saltB)}
+local ${saltNameC}=${num(saltC || saltA ^ saltB)}
 local ${maskName}=${num(seedMask)}
-${fragNames.map((fn,i)=>`local ${fn}="${escLuaStr(seedFrags[i])}"`).join("\n")}
+${fragDecls}
+${fragReconstruct}
 local ${seedName}=${fragNames.join("..")}
 do
 local h=${seedName}
@@ -1194,14 +1219,25 @@ t[i]=string.char(byte)
 end
 ${seedName}=table.concat(t)
 end
+-- multi-round key derivation (exact mirror of host KDF)
 local ${keyName}={}
 do
-local s=(${saltNameA}~${saltNameB}~(${cXor}))%4294967296
+local s=(${saltNameA}~${saltNameB}~${saltNameC}~(${cXor}))%4294967296
+for round=0,2 do
 for i=1,16 do
 local b=${seedName}:byte(((i-1)%#${seedName})+1)
-s=((s~b)*(${cMul})+(${cAdd}))%4294967296
+local b2=${seedName}:byte(((i+16+round-1)%#${seedName})+1)
+s=((s~b~b2~(round*(${cPhi})))*(${cMul})+(${cAdd}))%4294967296
 local sh=((i-1)%4)*8
-${keyName}[i]=math.floor(s/(2^sh))%256
+local prev=${keyName}[i] or 0
+${keyName}[i]=(prev~math.floor(s/(2^sh))%256)%256
+end
+s=(s*(${cPhi})+${saltNameC})%4294967296
+end
+for i=1,16 do
+local sh=((i-1)%4)*8
+${keyName}[i]=(${keyName}[i]~math.floor(s/(2^sh))%256)%256
+s=(s*(${cMul})+(${cAdd}))%4294967296
 end
 end
 local bytes=${N.dec}(${payload},"${alphEsc}",${keyName},${num(pad)})
@@ -1243,14 +1279,18 @@ return c.d
 end
 local ${N.code}={}
 for ci=1,ncode do ${N.code}[ci]=u16(off) off=off+2 end
--- runtime integrity noise
+-- runtime integrity + light anti-tamper
 do
 local _z=0
-for _i=1,math.min(8,nconst) do
+for _i=1,math.min(12,nconst) do
 local _c=${N.kn}[_i]
 if _c and _c.e then _z=_z+#_c.e end
 end
-if _z<0 then while true do end end
+if _z<0 or type(${keyName})~="table" or #${keyName}<16 then while true do end end
+-- simple checksum over first few key bytes
+local _ksum=0
+for _i=1,8 do _ksum=_ksum+(${keyName}[_i] or 0) end
+if _ksum==0 then while true do end end
 end
 local function ${N.code}_at(i)
 local v=${N.code}[i]
@@ -1511,19 +1551,37 @@ function emitBytecodeObfuscation(src, intensity) {
   // Remap code LOADK indices — skip for now (would need full remap). Keep original order + trailing noise.
   constants = result.constants.concat(noiseConsts);
 
-  const seedStr = crypto.randomBytes(32).toString("base64");
+  // Stronger key material (v3.5): seed + 3 salts + multi-round KDF (host & Lua must match)
+  const seedStr = crypto.randomBytes(36).toString("base64"); // entropy source
   const saltA = randInt(1, 0x7fffffff);
   const saltB = randInt(1, 0x7fffffff);
-  const key = Buffer.alloc(16);
-  let ds = (saltA >>> 0) ^ (saltB >>> 0) ^ 0xa5a5a5a5;
-  for (let i = 0; i < 16; i++) {
-    ds = (Math.imul(ds ^ seedStr.charCodeAt(i % seedStr.length), 1664525) + 1013904223) >>> 0;
-    key[i] = (ds >>> ((i % 4) * 8)) & 0xff;
+  const saltC = randInt(1, 0x7fffffff);
+  // Host-side KDF that mirrors the Lua reconstruction path
+  function deriveKey(seed, sa, sb, sc) {
+    const key = Buffer.alloc(16);
+    let s = (sa ^ sb ^ sc ^ 0xa5a5a5a5) >>> 0;
+    for (let round = 0; round < 3; round++) {
+      for (let i = 0; i < 16; i++) {
+        const b = seed.charCodeAt(i % seed.length) & 0xff;
+        const b2 = seed.charCodeAt((i + 16 + round) % seed.length) & 0xff;
+        s = (Math.imul(s ^ b ^ b2 ^ (round * 0x9e3779b9), 1664525) + 1013904223) >>> 0;
+        const sh = (i % 4) * 8;
+        key[i] = (key[i] ^ ((s >>> sh) & 0xff)) & 0xff;
+      }
+      s = (Math.imul(s, 0x9e3779b9) + sc) >>> 0;
+    }
+    for (let i = 0; i < 16; i++) {
+      const sh = (i % 4) * 8;
+      key[i] = (key[i] ^ ((s >>> sh) & 0xff)) & 0xff;
+      s = (Math.imul(s, 1664525) + 1013904223) >>> 0;
+    }
+    return key;
   }
-  const packed = packProgram(code, constants, key); // pass key for per-constant XOR
+  const key = deriveKey(seedStr, saltA, saltB, saltC);
+  const packed = packProgram(code, constants, key);
   const enc = encodeBc(packed, key);
   const { b85: blob, alph, pad } = b85(enc);
-  const out = emitBcVm(blob, alph, pad, { seedStr, saltA, saltB }, op);
+  const out = emitBcVm(blob, alph, pad, { seedStr, saltA, saltB, saltC }, op);
   return { ok: true, code: out, mode: "bytecode" };
 }
 
@@ -1535,7 +1593,7 @@ function emitBytecodeObfuscation(src, intensity) {
  */
 
 const APP_NAME = "Euana";
-const VERSION = "3.4.0";
+const VERSION = "3.5.0";
 
 function randInt(a, b) {
   return a + Math.floor(Math.random() * (b - a + 1));
@@ -1956,7 +2014,7 @@ function obfuscateCode(code, intensity = "v3") {
   try {
     const bc = emitBytecodeObfuscation(src, intensity);
     if (bc.ok) {
-      return `-- Protected by ${APP_NAME} ${VERSION}\n-- ${date} | ${intensity} | bytecode\n${bc.code}\n`;
+      return `-- Protected by ${APP_NAME} ${VERSION}\n-- ${date} | ${intensity} | bytecode\n-- Validate each release on Luau fork before shipping\n${bc.code}\n`;
     }
   } catch (_) {
     /* fall through to CF-VM envelope */
@@ -1974,7 +2032,7 @@ function obfuscateCode(code, intensity = "v3") {
     current = emitVm(current, li);
   }
 
-  return `-- Protected by ${APP_NAME} ${VERSION}\n-- ${date} | ${intensity} | envelope\n${current}\n`;
+  return `-- Protected by ${APP_NAME} ${VERSION}\n-- ${date} | ${intensity} | envelope\n-- Validate each release on Luau fork before shipping\n${current}\n`;
 }
 
 function calcCost() {
@@ -1983,7 +2041,8 @@ function calcCost() {
 
 
 function runTests() {
-  const LUA = process.env.LUA || "/tmp/lua5.4";
+  // Prefer Luau if available (policy: every version validated on Luau fork before release)
+  const LUA = process.env.LUAU || process.env.LUA || "lua5.4";
   const cases = [
     ["print", "print(42)", "42"],
     ["math", "print(1+2*3)", "7"],
