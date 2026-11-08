@@ -998,23 +998,36 @@ function encodeBc(data, key) {
   return out;
 }
 
-function packProgram(code, constants) {
+function packProgram(code, constants, key) {
+  key = key || Buffer.alloc(16);
   const parts = [];
   const nconst = Buffer.alloc(4);
   nconst.writeUInt32LE(constants.length);
   const ncode = Buffer.alloc(4);
   ncode.writeUInt32LE(code.length);
   parts.push(nconst, ncode);
-  for (const c of constants) {
+  for (let ci = 0; ci < constants.length; ci++) {
+    const c = constants[ci];
     if (c === null || c === undefined) {
       parts.push(Buffer.from([0]));
     } else if (typeof c === "boolean") {
       parts.push(Buffer.from([1, c ? 1 : 0]));
     } else if (typeof c === "number") {
-      const s = Buffer.from(String(c), "utf8");
+      let s = Buffer.from(String(c), "utf8");
+      // per-constant XOR using key + index
+      let st = (key[ci % key.length] + ci * 131) >>> 0;
+      for (let j = 0; j < s.length; j++) {
+        st = (Math.imul(st, 1664525) + 1013904223) >>> 0;
+        s[j] ^= (st >>> 16) & 0xff;
+      }
       parts.push(Buffer.from([2, s.length & 0xff, (s.length >> 8) & 0xff]), s);
     } else {
-      const s = Buffer.from(String(c), "utf8");
+      let s = Buffer.from(String(c), "utf8");
+      let st = (key[ci % key.length] + ci * 131) >>> 0;
+      for (let j = 0; j < s.length; j++) {
+        st = (Math.imul(st, 1664525) + 1013904223) >>> 0;
+        s[j] ^= (st >>> 16) & 0xff;
+      }
       parts.push(Buffer.from([3, s.length & 0xff, (s.length >> 8) & 0xff]), s);
     }
   }
@@ -1187,7 +1200,12 @@ elseif tag==1 then ${N.kn}[ci]=bytes[off]~=0 off=off+1
 elseif tag==2 or tag==3 then
 local ln=bytes[off]+bytes[off+1]*256 off=off+2
 local chars={}
-for j=0,ln-1 do chars[j+1]=string.char(bytes[off+j]) end
+local st=(${keyName}[((ci-1)%#${keyName})+1]+(ci-1)*131)%4294967296
+for j=0,ln-1 do
+st=(st*1664525+1013904223)%4294967296
+local xb=${N.bx}(bytes[off+j],math.floor(st/65536)%256)
+chars[j+1]=string.char(xb)
+end
 off=off+ln
 local s=table.concat(chars)
 if tag==2 then ${N.kn}[ci]=tonumber(s) else ${N.kn}[ci]=s end
@@ -1412,13 +1430,42 @@ function emitBytecodeObfuscation(src, intensity) {
     return { ok: false, errors: result.errors };
   }
   let { code, constants, op } = result;
-  // noise constants
-  const noise = { v1: 2, v2: 6, v3: 12 }[intensity] || 6;
+
+  // Heavy noise — real constants buried among many fakes
+  const noise = { v1: 8, v2: 18, v3: 36 }[intensity] || 18;
   for (let i = 0; i < noise; i++) {
     constants.push(randInt(0x1000, 0xffffff));
+    constants.push(randIdent(randInt(6, 14)));
+    if (Math.random() < 0.4) constants.push(randIdent(randInt(4, 10)) + randIdent(4));
+  }
+  // Force minimum complexity for tiny scripts (e.g. print(1))
+  while (constants.length < 24) {
+    constants.push(randInt(100, 0xffffff));
     constants.push(randIdent(8));
   }
-  const seedStr = crypto.randomBytes(24).toString("base64");
+  // Shuffle constant table so index 0/1 are not always the real ones
+  // (compiler already interned; we only append noise after, so real ones stay low —
+  // extra: inject noise at front by rebuilding)
+  const realConsts = constants.slice(0, result.constants.length);
+  const noiseConsts = constants.slice(result.constants.length);
+  for (let i = noiseConsts.length - 1; i > 0; i--) {
+    const j = randInt(0, i);
+    [noiseConsts[i], noiseConsts[j]] = [noiseConsts[j], noiseConsts[i]];
+  }
+  // Keep real constants but interleave noise so linear scan is noisier
+  const mixed = [];
+  let ri = 0, ni = 0;
+  while (ri < realConsts.length || ni < noiseConsts.length) {
+    if (ni < noiseConsts.length && (ri >= realConsts.length || Math.random() < 0.55)) {
+      mixed.push(noiseConsts[ni++]);
+    } else if (ri < realConsts.length) {
+      mixed.push(realConsts[ri++]);
+    }
+  }
+  // Remap code LOADK indices — skip for now (would need full remap). Keep original order + trailing noise.
+  constants = result.constants.concat(noiseConsts);
+
+  const seedStr = crypto.randomBytes(32).toString("base64");
   const saltA = randInt(1, 0x7fffffff);
   const saltB = randInt(1, 0x7fffffff);
   const key = Buffer.alloc(16);
@@ -1427,7 +1474,7 @@ function emitBytecodeObfuscation(src, intensity) {
     ds = (Math.imul(ds ^ seedStr.charCodeAt(i % seedStr.length), 1664525) + 1013904223) >>> 0;
     key[i] = (ds >>> ((i % 4) * 8)) & 0xff;
   }
-  const packed = packProgram(code, constants);
+  const packed = packProgram(code, constants, key); // pass key for per-constant XOR
   const enc = encodeBc(packed, key);
   const { b85: blob, alph, pad } = b85(enc);
   const out = emitBcVm(blob, alph, pad, { seedStr, saltA, saltB }, op);
@@ -1442,7 +1489,7 @@ function emitBytecodeObfuscation(src, intensity) {
  */
 
 const APP_NAME = "Euana";
-const VERSION = "3.0.0";
+const VERSION = "3.1.0";
 
 function randInt(a, b) {
   return a + Math.floor(Math.random() * (b - a + 1));
@@ -1922,25 +1969,398 @@ function runTests() {
 }
 function serve(port) {
   port = Number(port) || Number(process.env.PORT) || 3000;
+  const html = `<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Euana ${VERSION}</title>
+<style>
+  :root {
+    --bg: #0b0f19;
+    --surface: #121826;
+    --surface2: #1a2234;
+    --border: #2a3548;
+    --text: #e8eef8;
+    --muted: #8b9bb4;
+    --accent: #6c8cff;
+    --accent2: #a78bfa;
+    --success: #34d399;
+    --danger: #f87171;
+    --radius: 12px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    line-height: 1.5;
+  }
+  .wrap {
+    max-width: 1100px;
+    margin: 0 auto;
+    padding: 32px 20px 60px;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 28px;
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .logo {
+    width: 40px;
+    height: 40px;
+    border-radius: 10px;
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    display: grid;
+    place-items: center;
+    font-weight: 800;
+    font-size: 18px;
+    color: #fff;
+  }
+  h1 {
+    font-size: 1.45rem;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+  }
+  .ver {
+    font-size: 0.8rem;
+    color: var(--muted);
+    background: var(--surface2);
+    padding: 3px 9px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+  }
+  .grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 18px;
+  }
+  @media (max-width: 820px) {
+    .grid { grid-template-columns: 1fr; }
+  }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+  }
+  .card-h {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: var(--surface2);
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: var(--muted);
+  }
+  textarea, pre {
+    width: 100%;
+    min-height: 340px;
+    padding: 16px;
+    background: transparent;
+    border: none;
+    color: var(--text);
+    font-family: "SF Mono", "Fira Code", "Cascadia Code", Consolas, monospace;
+    font-size: 13.5px;
+    line-height: 1.55;
+    resize: vertical;
+    outline: none;
+  }
+  pre {
+    white-space: pre-wrap;
+    word-break: break-all;
+    overflow: auto;
+    margin: 0;
+  }
+  .toolbar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin: 18px 0;
+    flex-wrap: wrap;
+  }
+  select, button, .file-btn {
+    font: inherit;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--surface2);
+    color: var(--text);
+    padding: 9px 14px;
+    cursor: pointer;
+    transition: 0.15s ease;
+  }
+  select:hover, button:hover, .file-btn:hover {
+    border-color: var(--accent);
+  }
+  button.primary {
+    background: linear-gradient(135deg, var(--accent), #5b7cfa);
+    border: none;
+    color: #fff;
+    font-weight: 600;
+    padding: 10px 22px;
+  }
+  button.primary:hover {
+    filter: brightness(1.08);
+  }
+  button.primary:disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
+    filter: none;
+  }
+  button.ghost, .file-btn {
+    background: transparent;
+  }
+  .file-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .status {
+    font-size: 0.82rem;
+    color: var(--muted);
+    margin-left: auto;
+  }
+  .status.ok { color: var(--success); }
+  .status.err { color: var(--danger); }
+  footer {
+    margin-top: 28px;
+    text-align: center;
+    font-size: 0.8rem;
+    color: var(--muted);
+  }
+  #fileInput { display: none; }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div class="brand">
+        <div class="logo">E</div>
+        <div>
+          <h1>Euana</h1>
+        </div>
+        <span class="ver">v${VERSION}</span>
+      </div>
+    </header>
+
+    <div class="toolbar">
+      <label style="font-size:0.85rem;color:var(--muted)">Intensity</label>
+      <select id="iv">
+        <option value="v1">v1 — Light</option>
+        <option value="v2">v2 — Medium</option>
+        <option value="v3" selected>v3 — Heavy</option>
+      </select>
+      <button class="primary" id="go">Obfuscate</button>
+      <label class="file-btn" for="fileInput">Upload File</label>
+      <input type="file" id="fileInput" accept=".lua,.txt,.luau,.luac,text/plain">
+      <button class="ghost" id="download">Download</button>
+      <button class="ghost" id="copy">Copy Output</button>
+      <button class="ghost" id="clear">Clear</button>
+      <span class="status" id="status">Ready</span>
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <div class="card-h">
+          <span>Input (Lua / Luau)</span>
+          <span id="inLen" style="font-weight:400">0 chars</span>
+        </div>
+        <textarea id="src" spellcheck="false" placeholder="-- paste your Lua / Luau code here
+print('hello from Euana')">print("Hello from Euana")
+local function add(a, b)
+  return a + b
+end
+print(add(20, 22))</textarea>
+      </div>
+      <div class="card">
+        <div class="card-h">
+          <span>Output</span>
+          <span id="outLen" style="font-weight:400">0 chars</span>
+        </div>
+        <pre id="out">// obfuscated code will appear here</pre>
+      </div>
+    </div>
+
+    <footer>Protected by Euana · Bytecode / CF-VM Obfuscator</footer>
+  </div>
+
+<script>
+const src = document.getElementById("src");
+const out = document.getElementById("out");
+const iv = document.getElementById("iv");
+const go = document.getElementById("go");
+const status = document.getElementById("status");
+const inLen = document.getElementById("inLen");
+const outLen = document.getElementById("outLen");
+const fileInput = document.getElementById("fileInput");
+
+function updateLens() {
+  inLen.textContent = src.value.length.toLocaleString() + " chars";
+  outLen.textContent = (out.textContent || "").length.toLocaleString() + " chars";
+}
+src.addEventListener("input", updateLens);
+updateLens();
+
+go.onclick = async () => {
+  if (!src.value.trim()) {
+    status.textContent = "Input is empty";
+    status.className = "status err";
+    return;
+  }
+  go.disabled = true;
+  status.textContent = "Obfuscating…";
+  status.className = "status";
+  const t0 = performance.now();
+  try {
+    const r = await fetch("/api/obfuscate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ code: src.value, intensity: iv.value })
+    });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || "Request failed");
+    out.textContent = j.code || "";
+    const ms = Math.round(performance.now() - t0);
+    status.textContent = "Done in " + ms + "ms · " + (j.version || "");
+    status.className = "status ok";
+    updateLens();
+  } catch (e) {
+    status.textContent = String(e.message || e);
+    status.className = "status err";
+  } finally {
+    go.disabled = false;
+  }
+};
+
+document.getElementById("copy").onclick = async () => {
+  const t = out.textContent || "";
+  if (!t || t.startsWith("//")) return;
+  try {
+    await navigator.clipboard.writeText(t);
+    status.textContent = "Copied to clipboard";
+    status.className = "status ok";
+  } catch {
+    status.textContent = "Copy failed";
+    status.className = "status err";
+  }
+};
+
+document.getElementById("clear").onclick = () => {
+  src.value = "";
+  out.textContent = "// obfuscated code will appear here";
+  status.textContent = "Cleared";
+  status.className = "status";
+  fileInput.value = "";
+  updateLens();
+};
+
+// Upload file → load into input (robust)
+fileInput.addEventListener("change", async () => {
+  const file = fileInput.files && fileInput.files[0];
+  if (!file) return;
+
+  // size guard (10MB)
+  if (file.size > 10 * 1024 * 1024) {
+    status.textContent = "File too large (max 10MB)";
+    status.className = "status err";
+    fileInput.value = "";
+    return;
+  }
+
+  status.textContent = "Reading " + file.name + "…";
+  status.className = "status";
+
+  try {
+    let text = "";
+    // Prefer modern API first
+    if (file.text) {
+      text = await file.text();
+    } else {
+      text = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result || ""));
+        reader.onerror = () => reject(reader.error || new Error("read error"));
+        reader.readAsText(file);
+      });
+    }
+    src.value = text;
+    status.textContent = "Loaded: " + file.name + " (" + text.length.toLocaleString() + " chars)";
+    status.className = "status ok";
+    updateLens();
+  } catch (e) {
+    console.error(e);
+    status.textContent = "Load failed — try a smaller file or desktop browser";
+    status.className = "status err";
+  }
+});
+
+// Download output as .lua file
+document.getElementById("download").onclick = () => {
+  const t = out.textContent || "";
+  if (!t || t.startsWith("//")) {
+    status.textContent = "No output to download";
+    status.className = "status err";
+    return;
+  }
+  const blob = new Blob([t], { type: "text/plain;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "euana_obfuscated.lua";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+  status.textContent = "Download started";
+  status.className = "status ok";
+};
+</script>
+</body>
+</html>`;
   http.createServer((req, res) => {
     if (req.method === "GET" && req.url === "/") {
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-      res.end("<!doctype html><title>Euana</title><h1>Euana "+VERSION+"</h1><textarea id=src rows=12 style='width:100%'>print(1)</textarea><br><select id=iv><option>v1</option><option>v2</option><option selected>v3</option></select><button id=go>Go</button><pre id=out></pre><script>go.onclick=async()=>{const r=await fetch('/api/obfuscate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code:src.value,intensity:iv.value})});out.textContent=(await r.json()).code}</script>");
+      res.end(html);
       return;
     }
     if (req.method === "POST" && req.url === "/api/obfuscate") {
-      let body=""; req.on("data",c=>body+=c); req.on("end",()=>{
+      let body = "";
+      req.on("data", (c) => (body += c));
+      req.on("end", () => {
         try {
-          const j=JSON.parse(body||"{}");
-          res.writeHead(200,{"Content-Type":"application/json"});
-          res.end(JSON.stringify({code:obfuscateCode(j.code||"",j.intensity||"v3"),version:VERSION}));
-        } catch(e) { res.writeHead(500); res.end(JSON.stringify({error:String(e.message||e)})); }
+          const j = JSON.parse(body || "{}");
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              code: obfuscateCode(j.code || "", j.intensity || "v3"),
+              version: VERSION,
+            })
+          );
+        } catch (e) {
+          res.writeHead(500);
+          res.end(JSON.stringify({ error: String(e.message || e) }));
+        }
       });
       return;
     }
-    res.writeHead(404); res.end("not found");
-  }).listen(port,()=>console.log("Euana "+VERSION+" :"+port));
+    res.writeHead(404);
+    res.end("not found");
+  }).listen(port, () => console.log("Euana " + VERSION + " :" + port));
 }
+
 function mainCli() {
   const args = process.argv.slice(2);
   if (args[0]==="--test") return runTests();
