@@ -1044,8 +1044,12 @@ function packProgram(code, constants, key) {
       parts.push(Buffer.from([3, s.length & 0xff, (s.length >> 8) & 0xff]), s);
     }
   }
-  for (const op of code) {
-    const v = op & 0xffff;
+  // Encrypt each code word with keystream(key, index) so raw dump != opcodes
+  for (let ci = 0; ci < code.length; ci++) {
+    let v = code[ci] & 0xffff;
+    let st = (key[ci % key.length] + ci * 2654435761) >>> 0;
+    st = (Math.imul(st, 1664525) + 1013904223) >>> 0;
+    v ^= (st >>> 16) & 0xffff;
     parts.push(Buffer.from([v & 0xff, (v >> 8) & 0xff]));
   }
   return Buffer.concat(parts);
@@ -1248,6 +1252,13 @@ if _c and _c.e then _z=_z+#_c.e end
 end
 if _z<0 then while true do end end
 end
+local function ${N.code}_at(i)
+local v=${N.code}[i]
+if not v then return 0 end
+local st=(${keyName}[((i-1)%#${keyName})+1]+(i-1)*2654435761)%4294967296
+st=(st*1664525+1013904223)%4294967296
+return ${N.bx}(v%256,math.floor(st/65536)%256)+${N.bx}(math.floor(v/256)%256,math.floor(st/16777216)%256)*256
+end
 local ${N.env}=(type(_G)=="table" and _G) or {}
 local function ${N.vm}(...)
 local ${N.st}={} local ${N.sp}=0 local ${N.pc}=1
@@ -1255,30 +1266,30 @@ local ${N.locals}={}
 local function push(v) ${N.sp}=${N.sp}+1 ${N.st}[${N.sp}]=v end
 local function pop() local v=${N.st}[${N.sp}] ${N.st}[${N.sp}]=nil ${N.sp}=${N.sp}-1 return v end
 while ${N.pc}<=ncode do
-local op=${N.code}[${N.pc}] ${N.pc}=${N.pc}+1
+local op=${N.code}_at(${N.pc}) ${N.pc}=${N.pc}+1
 if op==${OP("LOADK")} then
-local idx=${N.code}[${N.pc}] ${N.pc}=${N.pc}+1
+local idx=${N.code}_at(${N.pc}) ${N.pc}=${N.pc}+1
 push(${N.kn}_get(idx+1))
 elseif op==${OP("LOADNIL")} then push(nil)
 elseif op==${OP("LOADBOOL")} then
-local v=${N.code}[${N.pc}] ${N.pc}=${N.pc}+1
+local v=${N.code}_at(${N.pc}) ${N.pc}=${N.pc}+1
 push(v~=0)
 elseif op==${OP("GETGLOBAL")} then
-local idx=${N.code}[${N.pc}] ${N.pc}=${N.pc}+1
+local idx=${N.code}_at(${N.pc}) ${N.pc}=${N.pc}+1
 local name=${N.kn}_get(idx+1)
 local v=rawget(${N.env},name)
 if v==nil then v=_G[name] end
 push(v)
 elseif op==${OP("SETGLOBAL")} then
-local idx=${N.code}[${N.pc}] ${N.pc}=${N.pc}+1
+local idx=${N.code}_at(${N.pc}) ${N.pc}=${N.pc}+1
 local name=${N.kn}_get(idx+1)
 local val=pop()
 if type(${N.env})=="table" then rawset(${N.env},name,val) else _G[name]=val end
 elseif op==${OP("GETLOCAL")} then
-local slot=${N.code}[${N.pc}] ${N.pc}=${N.pc}+1
+local slot=${N.code}_at(${N.pc}) ${N.pc}=${N.pc}+1
 push(${N.locals}[slot])
 elseif op==${OP("SETLOCAL")} then
-local slot=${N.code}[${N.pc}] ${N.pc}=${N.pc}+1
+local slot=${N.code}_at(${N.pc}) ${N.pc}=${N.pc}+1
 ${N.locals}[slot]=pop()
 elseif op==${OP("ADD")} then local b,a=pop(),pop() push(a+b)
 elseif op==${OP("SUB")} then local b,a=pop(),pop() push(a-b)
@@ -1297,20 +1308,20 @@ elseif op==${OP("NOT")} then push(not pop())
 elseif op==${OP("UNM")} then push(-pop())
 elseif op==${OP("LEN")} then push(#pop())
 elseif op==${OP("JMP")} then
-local off=${N.code}[${N.pc}] ${N.pc}=${N.pc}+1
+local off=${N.code}_at(${N.pc}) ${N.pc}=${N.pc}+1
 if off>=0x8000 then off=off-0x10000 end
 ${N.pc}=${N.pc}+off
 elseif op==${OP("JMPIF")} then
-local off=${N.code}[${N.pc}] ${N.pc}=${N.pc}+1
+local off=${N.code}_at(${N.pc}) ${N.pc}=${N.pc}+1
 if off>=0x8000 then off=off-0x10000 end
 if pop() then ${N.pc}=${N.pc}+off end
 elseif op==${OP("JMPIFNOT")} then
-local off=${N.code}[${N.pc}] ${N.pc}=${N.pc}+1
+local off=${N.code}_at(${N.pc}) ${N.pc}=${N.pc}+1
 if off>=0x8000 then off=off-0x10000 end
 if not pop() then ${N.pc}=${N.pc}+off end
 elseif op==${OP("CALL")} then
-local nargs=${N.code}[${N.pc}] ${N.pc}=${N.pc}+1
-local nrets=${N.code}[${N.pc}] ${N.pc}=${N.pc}+1
+local nargs=${N.code}_at(${N.pc}) ${N.pc}=${N.pc}+1
+local nrets=${N.code}_at(${N.pc}) ${N.pc}=${N.pc}+1
 local args={}
 for i=nargs,1,-1 do args[i]=pop() end
 local fn=pop()
@@ -1322,7 +1333,7 @@ elseif nrets==0 then
 else for i=1,rets.n do push(rets[i]) end end
 else push(nil) end
 elseif op==${OP("RETURN")} then
-local n=${N.code}[${N.pc}] ${N.pc}=${N.pc}+1
+local n=${N.code}_at(${N.pc}) ${N.pc}=${N.pc}+1
 local rets={}
 for i=n,1,-1 do rets[i]=pop() end
 return table.unpack(rets,1,n)
@@ -1342,8 +1353,8 @@ elseif op==${OP("SWAP")} then
 local a=pop() local b=pop() push(a) push(b)
 elseif op==${OP("HALT")} then break
 elseif op==${OP("CLOSURE")} then
-local entry=${N.code}[${N.pc}] ${N.pc}=${N.pc}+1
-local nparams=${N.code}[${N.pc}] ${N.pc}=${N.pc}+1
+local entry=${N.code}_at(${N.pc}) ${N.pc}=${N.pc}+1
+local nparams=${N.code}_at(${N.pc}) ${N.pc}=${N.pc}+1
 local code_ref, kn_ref, env_ref = ${N.code}, ${N.kn}, ${N.env}
 push(function(...)
 local args=table.pack(...)
@@ -1353,16 +1364,16 @@ for i=1,math.min(nparams,args.n) do locals[i-1]=args[i] end
 local function push2(v) sp=sp+1 st[sp]=v end
 local function pop2() local v=st[sp] st[sp]=nil sp=sp-1 return v end
 while pc<=ncode do
-local op2=code_ref[pc] pc=pc+1
-if op2==${OP("LOADK")} then local idx=code_ref[pc] pc=pc+1 push2(${N.kn}_get(idx+1))
+local op2=${N.code}_at(pc) pc=pc+1
+if op2==${OP("LOADK")} then local idx=${N.code}_at(pc) pc=pc+1 push2(${N.kn}_get(idx+1))
 elseif op2==${OP("LOADNIL")} then push2(nil)
-elseif op2==${OP("LOADBOOL")} then local v=code_ref[pc] pc=pc+1 push2(v~=0)
+elseif op2==${OP("LOADBOOL")} then local v=${N.code}_at(pc) pc=pc+1 push2(v~=0)
 elseif op2==${OP("GETGLOBAL")} then
-local idx=code_ref[pc] pc=pc+1
+local idx=${N.code}_at(pc) pc=pc+1
 local name=${N.kn}_get(idx+1)
 push2(rawget(env_ref,name) or _G[name])
-elseif op2==${OP("GETLOCAL")} then local slot=code_ref[pc] pc=pc+1 push2(locals[slot])
-elseif op2==${OP("SETLOCAL")} then local slot=code_ref[pc] pc=pc+1 locals[slot]=pop2()
+elseif op2==${OP("GETLOCAL")} then local slot=${N.code}_at(pc) pc=pc+1 push2(locals[slot])
+elseif op2==${OP("SETLOCAL")} then local slot=${N.code}_at(pc) pc=pc+1 locals[slot]=pop2()
 elseif op2==${OP("ADD")} then local b,a=pop2(),pop2() push2(a+b)
 elseif op2==${OP("SUB")} then local b,a=pop2(),pop2() push2(a-b)
 elseif op2==${OP("MUL")} then local b,a=pop2(),pop2() push2(a*b)
@@ -1372,7 +1383,7 @@ elseif op2==${OP("EQ")} then local b,a=pop2(),pop2() push2(a==b)
 elseif op2==${OP("NE")} then local b,a=pop2(),pop2() push2(a~=b)
 elseif op2==${OP("LT")} then local b,a=pop2(),pop2() push2(a<b)
 elseif op2==${OP("CALL")} then
-local na=code_ref[pc] pc=pc+1 local nr=code_ref[pc] pc=pc+1
+local na=${N.code}_at(pc) pc=pc+1 local nr=${N.code}_at(pc) pc=pc+1
 local a2={} for i=na,1,-1 do a2[i]=pop2() end
 local fn=pop2()
 if type(fn)=="function" then
@@ -1382,7 +1393,7 @@ elseif nr>1 then for i=1,nr do push2(rets[i]) end
 else for i=1,rets.n do push2(rets[i]) end end
 else push2(nil) end
 elseif op2==${OP("RETURN")} then
-local n=code_ref[pc] pc=pc+1
+local n=${N.code}_at(pc) pc=pc+1
 local rets={} for i=n,1,-1 do rets[i]=pop2() end
 return table.unpack(rets,1,n)
 elseif op2==${OP("POP")} then pop2()
@@ -1391,7 +1402,7 @@ elseif op2==${OP("SETTABLE")} then
 local key=pop2() local val=pop2() local tbl=pop2()
 tbl[key]=val push2(tbl)
 elseif op2==${OP("SETGLOBAL")} then
-local idx=code_ref[pc] pc=pc+1
+local idx=${N.code}_at(pc) pc=pc+1
 local name=${N.kn}_get(idx+1)
 local val=pop2()
 if type(env_ref)=="table" then rawset(env_ref,name,val) else _G[name]=val end
@@ -1411,12 +1422,12 @@ elseif op2==${OP("MOD")} then local b,a=pop2(),pop2() push2(a%b)
 elseif op2==${OP("POW")} then local b,a=pop2(),pop2() push2(a^b)
 elseif op2==${OP("DUP")} then local v=pop2() push2(v) push2(v)
 elseif op2==${OP("JMP")} then
-local off=code_ref[pc] pc=pc+1 if off>=0x8000 then off=off-0x10000 end pc=pc+off
+local off=${N.code}_at(pc) pc=pc+1 if off>=0x8000 then off=off-0x10000 end pc=pc+off
 elseif op2==${OP("JMPIF")} then
-local off=code_ref[pc] pc=pc+1 if off>=0x8000 then off=off-0x10000 end
+local off=${N.code}_at(pc) pc=pc+1 if off>=0x8000 then off=off-0x10000 end
 if pop2() then pc=pc+off end
 elseif op2==${OP("JMPIFNOT")} then
-local off=code_ref[pc] pc=pc+1 if off>=0x8000 then off=off-0x10000 end
+local off=${N.code}_at(pc) pc=pc+1 if off>=0x8000 then off=off-0x10000 end
 if not pop2() then pc=pc+off end
 elseif op2==${OP("HALT")} then break
 else break end
@@ -1524,7 +1535,7 @@ function emitBytecodeObfuscation(src, intensity) {
  */
 
 const APP_NAME = "Euana";
-const VERSION = "3.3.0";
+const VERSION = "3.4.0";
 
 function randInt(a, b) {
   return a + Math.floor(Math.random() * (b - a + 1));
