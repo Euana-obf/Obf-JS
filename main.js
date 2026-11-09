@@ -1567,7 +1567,7 @@ function emitBytecodeObfuscation(src, intensity) {
  */
 
 const APP_NAME = "Euana";
-const VERSION = "4.0.0";
+const VERSION = "4.1.0";
 
 function randInt(a, b) {
   return a + Math.floor(Math.random() * (b - a + 1));
@@ -1968,6 +1968,36 @@ function selfTestCrypto() {
   return true;
 }
 
+/**
+ * True if `output` still contains readable fragments of user source.
+ * Used to guarantee original source is not left in plaintext.
+ */
+function leaksPlainSource(output, source) {
+  if (!output || !source) return false;
+  const out = String(output);
+  const src = String(source);
+  // Significant non-comment lines
+  const lines = src.split(/\n/).map((l) => l.trim()).filter((l) => {
+    if (l.length < 14) return false;
+    if (l.startsWith("--")) return false;
+    return true;
+  });
+  for (const line of lines) {
+    if (out.includes(line)) return true;
+  }
+  // Sliding window over denser source
+  if (src.length >= 20) {
+    const step = 12;
+    const win = 20;
+    for (let i = 0; i + win <= src.length; i += step) {
+      const chunk = src.slice(i, i + win);
+      if (/^\s+$/.test(chunk)) continue;
+      if (out.includes(chunk)) return true;
+    }
+  }
+  return false;
+}
+
 function obfuscateCode(code, intensity = "v3") {
   code = (code || "").trim();
   if (!code) return "-- empty";
@@ -1983,18 +2013,24 @@ function obfuscateCode(code, intensity = "v3") {
   src = preprocessLuau(src);
 
   const date = new Date().toISOString().slice(0, 10);
+  const header = (mode) =>
+    `-- Protected by ${APP_NAME} ${VERSION}\n-- ${date} | ${intensity} | ${mode} | no-plain-source\n`;
 
-  // Prefer real bytecode (no user source in output)
+  // 1) Bytecode VM — original source must not appear as plaintext
   try {
     const bc = emitBytecodeObfuscation(src, intensity);
     if (bc.ok) {
-      return `-- Protected by ${APP_NAME} ${VERSION}\n-- ${date} | ${intensity} | bytecode\n${bc.code}\n`;
+      const body = bc.code;
+      if (!leaksPlainSource(body, src)) {
+        return header("bytecode") + body + "\n";
+      }
+      // leaked → fall through to encrypted envelope
     }
   } catch (_) {
-    /* fall through to CF-VM envelope */
+    /* fall through */
   }
 
-  // Fallback: multi-layer CF VM (source only inside encrypted chunks)
+  // 2) Encrypted envelope — source only inside ciphertext chunks
   let layers = { v1: 2, v2: 3, v3: 5 }[intensity] || 3;
   if (src.length > 500000) layers = Math.min(layers, 2);
   else if (src.length > 150000) layers = Math.min(layers, 3);
@@ -2006,7 +2042,16 @@ function obfuscateCode(code, intensity = "v3") {
     current = emitVm(current, li);
   }
 
-  return `-- Protected by ${APP_NAME} ${VERSION}\n-- ${date} | ${intensity} | envelope\n${current}\n`;
+  // Final guarantee: never ship if plaintext source still visible
+  if (leaksPlainSource(current, src)) {
+    // last resort: one more envelope layer
+    current = emitVm(current, "v3");
+  }
+  if (leaksPlainSource(current, src)) {
+    return header("blocked") + `-- error: refused to emit plaintext source\n`;
+  }
+
+  return header("envelope") + current + "\n";
 }
 
 function calcCost() {
