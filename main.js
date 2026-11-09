@@ -1029,38 +1029,25 @@ function packProgram(code, constants, key) {
       let s = Buffer.from(String(c), "utf8");
       // per-constant XOR using key + index
       let st = (key[ci % key.length] + ci * 131) >>> 0;
-      const sA = (key._saltA >>> 0) || 0;
-      const sB = (key._saltB >>> 0) || 0;
-      st = (st + sA + sB) >>> 0;
       for (let j = 0; j < s.length; j++) {
         st = (Math.imul(st, 1664525) + 1013904223) >>> 0;
-        let k1 = (st >>> 16) & 0xff;
-        st = (Math.imul(st, 1664525) + 1013904223) >>> 0;
-        let k2 = (st >>> 16) & 0xff;
-        s[j] ^= k1 ^ k2;
+        s[j] ^= (st >>> 16) & 0xff;
       }
       parts.push(Buffer.from([2, s.length & 0xff, (s.length >> 8) & 0xff]), s);
     } else {
       let s = Buffer.from(String(c), "utf8");
       let st = (key[ci % key.length] + ci * 131) >>> 0;
-      const sA = (key._saltA >>> 0) || 0;
-      const sB = (key._saltB >>> 0) || 0;
-      st = (st + sA + sB) >>> 0;
       for (let j = 0; j < s.length; j++) {
         st = (Math.imul(st, 1664525) + 1013904223) >>> 0;
-        let k1 = (st >>> 16) & 0xff;
-        st = (Math.imul(st, 1664525) + 1013904223) >>> 0;
-        let k2 = (st >>> 16) & 0xff;
-        s[j] ^= k1 ^ k2;
+        s[j] ^= (st >>> 16) & 0xff;
       }
       parts.push(Buffer.from([3, s.length & 0xff, (s.length >> 8) & 0xff]), s);
     }
   }
-  // Encrypt each code word; mixMul from VM profile
-  const mixMul = (key._mixMul >>> 0) || 0x9e3779b9;
+  // Encrypt each code word with fixed keystream
   for (let ci = 0; ci < code.length; ci++) {
     let v = code[ci] & 0xffff;
-    let st = (key[ci % 16] ^ (Math.imul(ci, mixMul) >>> 0)) >>> 0;
+    let st = (key[ci % 16] ^ ((ci * 0x9e3779b9) >>> 0)) >>> 0;
     st = (Math.imul(st, 1664525) + 1013904223) >>> 0;
     const mask = (st >>> 16) & 0xffff;
     v = (v ^ mask) & 0xffff;
@@ -1108,26 +1095,17 @@ function emitBcVm(blob, alph, pad, keyMat, op) {
   const seedName = randIdent(10);
   const saltNameA = randIdent(8);
   const saltNameB = randIdent(8);
-  // split seed hex into fragments; each byte XOR-masked so concat alone != seed
+  // split seed into ASCII fragments; store as hex pairs so file encoding cannot corrupt
   const seedHex = Buffer.from(seedStr, "utf8").toString("hex"); // only 0-9a-f
-  const nFrag = 4 + randInt(0, 2); // 4–6 fragments
+  const nFrag = 3 + randInt(0, 1);
   const fragSize = Math.ceil(seedHex.length / nFrag);
-  const seedMask = randInt(1, 255);
   const seedFrags = [];
   for (let i = 0; i < seedHex.length; i += fragSize) {
-    const raw = seedHex.slice(i, i + fragSize);
-    let masked = "";
-    const hexChars = "0123456789abcdef";
-    for (let j = 0; j < raw.length; j++) {
-      // global nibble index so Lua unmask (mx+i-1)%16 matches
-      const gi = i + j;
-      const v = parseInt(raw[j], 16) ^ ((seedMask + gi) & 15);
-      masked += hexChars[v & 15];
-    }
-    seedFrags.push(masked);
+    seedFrags.push(seedHex.slice(i, i + fragSize));
   }
   const fragNames = seedFrags.map(() => randIdent(7));
-  const maskName = randIdent(7);
+  const maskName = randIdent(7); // unused, keep for template compat
+  const seedMask = 0;
   function escLuaStr(s) {
     return s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
   }
@@ -1183,14 +1161,6 @@ local r,p=0,1
 for _=1,8 do local ba,bb=a%2,b%2 r=r+((ba+bb)%2)*p a=math.floor(a/2) b=math.floor(b/2) p=p*2 end
 return r
 end
-local function ${randIdent(9)}(blob,alpha,key,pad)
--- decoy decoder (wrong LCG) — traps naive reimplementation
-local base=#alpha local idx={}
-for i=1,base do idx[alpha:sub(i,i)]=i-1 end
-local out={}
-for i=1,math.min(32,#blob) do out[i]=(blob:byte(i) or 0) end
-return out
-end
 local function ${N.dec}(blob,alpha,key,pad)
 local base=#alpha local idx={}
 for i=1,base do idx[alpha:sub(i,i)]=i-1 end
@@ -1224,18 +1194,6 @@ ${fragNames.map((fn,i)=>`local ${fn}="${escLuaStr(seedFrags[i])}"`).join("\n")}
 local ${seedName}=${fragNames.join("..")}
 do
 local h=${seedName}
-local mx=${maskName}
-local hexc="0123456789abcdef"
-local inv={}
-for i=0,15 do inv[hexc:sub(i+1,i+1)]=i end
-local plain={}
-for i=1,#h do
-local ch=h:sub(i,i)
-local v=inv[ch] or 0
-v=${N.bx}(v,(mx+i-1)%16)
-plain[i]=hexc:sub(v+1,v+1)
-end
-h=table.concat(plain)
 local t={}
 for i=1,#h/2 do
 local byte=tonumber(h:sub(i*2-1,i*2),16)
@@ -1279,16 +1237,13 @@ if c.t==1 then return c.v end
 if c.d~=nil then return c.d end
 local enc=c.e
 local st=(${keyName}[((c.i-1)%#${keyName})+1]+(c.i-1)*131)%4294967296
-st=(st+${saltNameA}+${saltNameB})%4294967296
 local chars={}
 for j=1,#enc do
 st=(st*1664525+1013904223)%4294967296
-local k1=math.floor(st/65536)%256
-st=(st*1664525+1013904223)%4294967296
-local k2=math.floor(st/65536)%256
-chars[j]=string.char(${N.bx}(${N.bx}(enc[j],k1),k2))
+chars[j]=string.char(${N.bx}(enc[j],math.floor(st/65536)%256))
 end
 local s=table.concat(chars)
+-- light integrity: length must match; frustrates partial patching
 if #s~=#enc then return nil end
 if c.t==2 then c.d=tonumber(s) else c.d=s end
 return c.d
@@ -1307,24 +1262,13 @@ if _c and _c.e then _z=_z+#_c.e end
 end
 if _z<0 then while true do end end
 end
-local function ${N.code}_umul(a,b)
-a=a%4294967296 b=b%4294967296
-local a0,a1=a%65536,math.floor(a/65536)%65536
-local b0,b1=b%65536,math.floor(b/65536)%65536
-local p0=a0*b0
-local p1=a0*b1+a1*b0
-return (p0+(p1%65536)*65536)%4294967296
-end
 local function ${N.code}_at(i)
 local v=${N.code}[i]
 if not v then return 0 end
 local kb=${keyName}[((i-1)%#${keyName})+1]
-local mix=${N.code}_umul((i-1),${mixMul})
+local mix=((i-1)*0x9E3779B9)%4294967296
 local st=(mix - mix%256 + ${N.bx}(kb,mix%256))%4294967296
-local s0,s1=st%65536,math.floor(st/65536)%65536
-local m0,m1=1664525%65536,math.floor(1664525/65536)%65536
-local p0=s0*m0 local p1=s0*m1+s1*m0
-st=(p0+(p1%65536)*65536+1013904223)%4294967296
+st=(st*1664525+1013904223)%4294967296
 local mask=math.floor(st/65536)%65536
 local lo=${N.bx}(v%256,mask%256)
 local hi=${N.bx}(math.floor(v/256)%256,math.floor(mask/256)%256)
@@ -1554,7 +1498,7 @@ function emitBytecodeObfuscation(src, intensity) {
   let { code, constants, op } = result;
 
   // Heavy noise — real constants buried among many fakes
-  const noise = { v1: 16, v2: 32, v3: 64 }[intensity] || 32;
+  const noise = { v1: 8, v2: 18, v3: 36 }[intensity] || 18;
   for (let i = 0; i < noise; i++) {
     constants.push(randInt(0x1000, 0xffffff));
     constants.push(randIdent(randInt(6, 14)));
@@ -1587,16 +1531,17 @@ function emitBytecodeObfuscation(src, intensity) {
   // Remap code LOADK indices — skip for now (would need full remap). Keep original order + trailing noise.
   constants = result.constants.concat(noiseConsts);
 
-  // Pick one of ~100 VM profiles
+  // Pick one of ~100 VM profiles (mixMul x shell; LCG coeffs stay IEEE-safe)
   const variant = randInt(0, 99);
   const MIX_MULS = [
     0x9e3779b9, 0x6c078965, 0x85ebca6b, 0xc2b2ae35, 0x27d4eb2d,
     0x165667b1, 0x94d049bb, 0x7f4a7c15, 0x5bd1e995, 0x1b873593
   ];
-  const mixMul = MIX_MULS[variant % 10];
+  // only small LCG multipliers safe in Lua double * then % 2^32
+  const mixMul = 0x9e3779b9;
   const mixA = 1664525;
   const mixB = 1013904223;
-  const shell = Math.floor(variant / 10) % 10;
+  const shell = Math.floor(variant / 10) % 10; // structural shell 0..9
 
   const seedStr = crypto.randomBytes(32).toString("base64");
   const saltA = randInt(1, 0x7fffffff);
@@ -1607,9 +1552,6 @@ function emitBytecodeObfuscation(src, intensity) {
     ds = (Math.imul(ds ^ seedStr.charCodeAt(i % seedStr.length), 1664525) + 1013904223) >>> 0;
     key[i] = (ds >>> ((i % 4) * 8)) & 0xff;
   }
-  key._mixMul = mixMul;
-  key._saltA = saltA;
-  key._saltB = saltB;
   const packed = packProgram(code, constants, key);
   const enc = encodeBc(packed, key);
   const { b85: blob, alph, pad } = b85(enc);
@@ -1625,7 +1567,7 @@ function emitBytecodeObfuscation(src, intensity) {
  */
 
 const APP_NAME = "Euana";
-const VERSION = "5.0.0";
+const VERSION = "4.1.0";
 
 function randInt(a, b) {
   return a + Math.floor(Math.random() * (b - a + 1));
@@ -2148,24 +2090,8 @@ function runTests() {
   console.log(pass + " pass / " + fail + " fail");
   process.exit(fail ? 1 : 0);
 }
-
 function serve(port) {
   port = Number(port) || Number(process.env.PORT) || 3000;
-
-  function json(res, code, obj) {
-    res.writeHead(code, { "Content-Type": "application/json; charset=utf-8" });
-    res.end(JSON.stringify(obj));
-  }
-
-  function readBody(req) {
-    return new Promise((resolve, reject) => {
-      let body = "";
-      req.on("data", (c) => (body += c));
-      req.on("end", () => resolve(body));
-      req.on("error", reject);
-    });
-  }
-
   const html = `<!DOCTYPE html>
 <html lang="ko">
 <head>
@@ -2174,561 +2100,387 @@ function serve(port) {
 <title>Euana ${VERSION}</title>
 <style>
   :root {
-    --bg0: #07060f; --bg1: #0d0a1a; --panel: rgba(22,16,40,0.94); --panel2: rgba(30,22,55,0.95);
-    --line: rgba(140,90,255,0.28); --line2: rgba(180,120,255,0.45);
-    --text: #f3eefc; --muted: #9b8fb8; --purple: #8b5cf6; --purple2: #a78bfa;
-    --green: #34d399; --danger: #f87171; --glow: 0 0 24px rgba(139,92,246,0.35); --radius: 14px;
+    --bg: #0b0f19;
+    --surface: #121826;
+    --surface2: #1a2234;
+    --border: #2a3548;
+    --text: #e8eef8;
+    --muted: #8b9bb4;
+    --accent: #6c8cff;
+    --accent2: #a78bfa;
+    --success: #34d399;
+    --danger: #f87171;
+    --radius: 12px;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
-    font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    background:
-      radial-gradient(1200px 600px at 10% -10%, rgba(124,58,237,0.25), transparent 60%),
-      radial-gradient(900px 500px at 90% 0%, rgba(91,33,182,0.18), transparent 55%),
-      linear-gradient(180deg, var(--bg0), var(--bg1));
-    color: var(--text); min-height: 100vh;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    line-height: 1.5;
   }
-  .topnav {
-    height: 64px; display: flex; align-items: center; justify-content: space-between;
-    padding: 0 22px; border-bottom: 1px solid var(--line);
-    background: rgba(10,8,20,0.85); backdrop-filter: blur(12px); position: sticky; top: 0; z-index: 20;
+  .wrap {
+    max-width: 1100px;
+    margin: 0 auto;
+    padding: 32px 20px 60px;
   }
-  .brand { display: flex; align-items: center; gap: 12px; font-weight: 800; cursor: pointer; }
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 28px;
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
   .logo {
-    width: 36px; height: 36px; border-radius: 10px;
-    background: linear-gradient(135deg,#7c3aed,#c084fc); box-shadow: var(--glow);
-    display: grid; place-items: center;
+    width: 40px;
+    height: 40px;
+    border-radius: 10px;
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    display: grid;
+    place-items: center;
+    font-weight: 800;
+    font-size: 18px;
+    color: #fff;
   }
-  .brand small { display: block; font-size: 10px; color: var(--muted); letter-spacing: 0.12em; }
-  .navlinks { display: flex; gap: 6px; flex-wrap: wrap; }
-  .navlinks button {
-    border: 1px solid transparent; background: transparent; color: var(--muted);
-    padding: 8px 14px; border-radius: 999px; font: inherit; font-size: 13px; cursor: pointer;
+  h1 {
+    font-size: 1.45rem;
+    font-weight: 700;
+    letter-spacing: -0.02em;
   }
-  .navlinks button.active, .navlinks button:hover {
-    color: #fff; background: rgba(139,92,246,0.2); border-color: var(--line2);
+  .ver {
+    font-size: 0.8rem;
+    color: var(--muted);
+    background: var(--surface2);
+    padding: 3px 9px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
   }
-  .status-pill { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
-  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); box-shadow: 0 0 10px var(--green); }
-  .layout {
-    display: grid; grid-template-columns: 240px 1fr; gap: 16px; padding: 18px;
-    max-width: 1400px; margin: 0 auto;
+  .grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 18px;
   }
-  @media (max-width: 900px) { .layout { grid-template-columns: 1fr; } }
-  .panel {
-    background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
-    box-shadow: 0 10px 40px rgba(0,0,0,0.35);
+  @media (max-width: 820px) {
+    .grid { grid-template-columns: 1fr; }
   }
-  .side { padding: 14px; height: fit-content; }
-  .side h3 { font-size: 12px; color: var(--muted); letter-spacing: 0.08em; margin: 8px 8px 12px; text-transform: uppercase; }
-  .menu button {
-    width: 100%; text-align: left; border: 1px solid transparent; background: transparent; color: var(--text);
-    padding: 12px 14px; border-radius: 12px; cursor: pointer; font: inherit; font-size: 13.5px;
-    display: flex; gap: 10px; align-items: center; margin-bottom: 6px;
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
   }
-  .menu button.active, .menu button:hover {
-    background: linear-gradient(90deg, rgba(124,58,237,0.35), rgba(124,58,237,0.08));
-    border-color: var(--line2);
+  .card-h {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: var(--surface2);
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: var(--muted);
   }
-  .main { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
-  .hero {
-    padding: 20px 22px; border-radius: var(--radius); border: 1px solid var(--line);
-    background: linear-gradient(120deg, rgba(124,58,237,0.22), transparent 55%), var(--panel);
+  textarea, pre {
+    width: 100%;
+    min-height: 340px;
+    padding: 16px;
+    background: transparent;
+    border: none;
+    color: var(--text);
+    font-family: "SF Mono", "Fira Code", "Cascadia Code", Consolas, monospace;
+    font-size: 13.5px;
+    line-height: 1.55;
+    resize: vertical;
+    outline: none;
   }
-  .hero h1 {
-    font-size: 1.45rem; font-weight: 800;
-    background: linear-gradient(90deg,#fff,#c4b5fd); -webkit-background-clip: text; color: transparent;
+  pre {
+    white-space: pre-wrap;
+    word-break: break-all;
+    overflow: auto;
+    margin: 0;
   }
-  .hero p { color: var(--muted); margin-top: 6px; font-size: 13px; }
-  .view { display: none; }
-  .view.active { display: block; }
-  .editor-wrap { overflow: hidden; }
-  .editor-h {
-    display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap;
-    padding: 12px 16px; border-bottom: 1px solid var(--line); background: var(--panel2);
+  .toolbar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin: 18px 0;
+    flex-wrap: wrap;
   }
-  .editor-h .title { font-weight: 700; font-size: 13px; color: var(--purple2); }
-  .tools { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
   select, button, .file-btn {
-    font: inherit; font-size: 12.5px; border-radius: 10px; border: 1px solid var(--line);
-    background: rgba(20,14,36,0.9); color: var(--text); padding: 8px 12px; cursor: pointer;
+    font: inherit;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--surface2);
+    color: var(--text);
+    padding: 9px 14px;
+    cursor: pointer;
+    transition: 0.15s ease;
+  }
+  select:hover, button:hover, .file-btn:hover {
+    border-color: var(--accent);
   }
   button.primary {
-    background: linear-gradient(135deg,#7c3aed,#a855f7); border: none; font-weight: 700; box-shadow: var(--glow);
+    background: linear-gradient(135deg, var(--accent), #5b7cfa);
+    border: none;
+    color: #fff;
+    font-weight: 600;
+    padding: 10px 22px;
   }
-  button.primary:disabled { opacity: 0.55; cursor: not-allowed; box-shadow: none; }
-  button.ghost { background: transparent; }
-  .file-btn { display: inline-flex; }
-  .hidden-file { display: none; }
-  .grid2 { display: grid; grid-template-columns: 1fr 1fr; min-height: 420px; }
-  @media (max-width: 820px) { .grid2 { grid-template-columns: 1fr; } }
-  .col { display: flex; flex-direction: column; border-right: 1px solid var(--line); min-height: 360px; }
-  .col:last-child { border-right: none; }
-  .col-h {
-    padding: 10px 14px; font-size: 12px; color: var(--muted); border-bottom: 1px solid var(--line);
-    display: flex; justify-content: space-between;
+  button.primary:hover {
+    filter: brightness(1.08);
   }
-  textarea, pre.out {
-    flex: 1; width: 100%; min-height: 320px; padding: 14px 16px; background: transparent; border: none;
-    color: var(--text); font-family: "JetBrains Mono","Fira Code",Consolas,monospace; font-size: 13px;
-    line-height: 1.55; resize: vertical; outline: none;
+  button.primary:disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
+    filter: none;
   }
-  pre.out { white-space: pre-wrap; word-break: break-all; overflow: auto; margin: 0; color: #ddd6fe; }
-  .status-line { padding: 10px 16px; font-size: 12px; color: var(--muted); border-top: 1px solid var(--line); }
-  .status-line.ok { color: var(--green); }
-  .status-line.err { color: var(--danger); }
-  .foot { text-align: center; color: var(--muted); font-size: 11.5px; padding: 10px 18px 22px; }
-  .card-note {
-    margin: 12px 16px 0; padding: 12px 14px; border-radius: 10px; border: 1px solid var(--line);
-    background: rgba(124,58,237,0.1); color: var(--muted); font-size: 12.5px; line-height: 1.5;
+  button.ghost, .file-btn {
+    background: transparent;
   }
+  .file-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .status {
+    font-size: 0.82rem;
+    color: var(--muted);
+    margin-left: auto;
+  }
+  .status.ok { color: var(--success); }
+  .status.err { color: var(--danger); }
+  footer {
+    margin-top: 28px;
+    text-align: center;
+    font-size: 0.8rem;
+    color: var(--muted);
+  }
+  #fileInput { display: none; }
 </style>
 </head>
 <body>
-  <header class="topnav">
-    <div class="brand" data-tab="obfuscate">
-      <div class="logo">E</div>
-      <div>EUANA<small>ULTIMATE VM</small></div>
+  <div class="wrap">
+    <header>
+      <div class="brand">
+        <div class="logo">E</div>
+        <div>
+          <h1>Euana</h1>
+        </div>
+        <span class="ver">v${VERSION}</span>
+      </div>
+    </header>
+
+    <div class="toolbar">
+      <label style="font-size:0.85rem;color:var(--muted)">Intensity</label>
+      <select id="iv">
+        <option value="v1">v1 — Light</option>
+        <option value="v2">v2 — Medium</option>
+        <option value="v3" selected>v3 — Heavy</option>
+      </select>
+      <button class="primary" id="go">Obfuscate</button>
+      <label class="file-btn" for="fileInput">Upload File</label>
+      <input type="file" id="fileInput" accept=".lua,.txt,.luau,.luac,text/plain">
+      <button class="ghost" id="download">Download</button>
+      <button class="ghost" id="copy">Copy Output</button>
+      <button class="ghost" id="clear">Clear</button>
+      <span class="status" id="status">Ready</span>
     </div>
-    <nav class="navlinks">
-      <button type="button" data-tab="obfuscate" class="active">난독화</button>
-      <button type="button" data-tab="compile">컴파일러</button>
-      <button type="button" data-tab="decompile">디컴파일러</button>
-      <button type="button" data-tab="analyze">분석기</button>
-    </nav>
-    <div class="status-pill"><span class="dot"></span> 서버 정상 · v${VERSION}</div>
-  </header>
 
-  <div class="layout">
-    <aside class="panel side">
-      <h3>기능 메뉴</h3>
-      <div class="menu">
-        <button type="button" data-tab="obfuscate" class="active"><span>🔒</span> 난독화</button>
-        <button type="button" data-tab="compile"><span>▶</span> 컴파일러</button>
-        <button type="button" data-tab="decompile"><span>↺</span> 디컴파일러</button>
-        <button type="button" data-tab="analyze"><span>📊</span> 코드 분석기</button>
-      </div>
-    </aside>
-
-    <section class="main">
-      <div class="hero">
-        <h1 id="heroTitle">EUANA ULTIMATE</h1>
-        <p id="heroDesc">커스텀 바이트코드 VM · 상수/스트림 암호화 · 원본 소스 평문 제거</p>
-      </div>
-
-      <!-- OBFUSCATE -->
-      <div class="view active" id="view-obfuscate">
-        <div class="panel editor-wrap">
-          <div class="editor-h">
-            <div class="title">난독화</div>
-            <div class="tools">
-              <select id="iv">
-                <option value="v1">v1 — Light</option>
-                <option value="v2">v2 — Medium</option>
-                <option value="v3" selected>v3 — Heavy</option>
-              </select>
-              <button class="primary" id="goObf">난독화 실행</button>
-              <label class="file-btn">업로드<input class="hidden-file" type="file" id="fileObf" accept=".lua,.txt,.luau,text/plain"></label>
-              <button class="ghost" id="dlObf">다운로드</button>
-              <button class="ghost" id="copyObf">복사</button>
-              <button class="ghost" id="clrObf">초기화</button>
-            </div>
-          </div>
-          <div class="grid2">
-            <div class="col">
-              <div class="col-h"><span>Input</span><span id="obfInLen">0</span></div>
-              <textarea id="obfSrc">print("Hello from Euana")
+    <div class="grid">
+      <div class="card">
+        <div class="card-h">
+          <span>Input (Lua / Luau)</span>
+          <span id="inLen" style="font-weight:400">0 chars</span>
+        </div>
+        <textarea id="src" spellcheck="false" placeholder="-- paste your Lua / Luau code here
+print('hello from Euana')">print("Hello from Euana")
 local function add(a, b)
   return a + b
 end
 print(add(20, 22))</textarea>
-            </div>
-            <div class="col">
-              <div class="col-h"><span>Output</span><span id="obfOutLen">0</span></div>
-              <pre class="out" id="obfOut">// 결과</pre>
-            </div>
-          </div>
-          <div class="status-line" id="obfStatus">Ready</div>
-        </div>
       </div>
+      <div class="card">
+        <div class="card-h">
+          <span>Output</span>
+          <span id="outLen" style="font-weight:400">0 chars</span>
+        </div>
+        <pre id="out">// obfuscated code will appear here</pre>
+      </div>
+    </div>
 
-      <!-- COMPILE -->
-      <div class="view" id="view-compile">
-        <div class="panel editor-wrap">
-          <div class="editor-h">
-            <div class="title">컴파일러 (Lua → Euana bytecode IR)</div>
-            <div class="tools">
-              <button class="primary" id="goCompile">컴파일</button>
-              <label class="file-btn">업로드<input class="hidden-file" type="file" id="fileCompile" accept=".lua,.txt,.luau,text/plain"></label>
-              <button class="ghost" id="copyCompile">복사</button>
-            </div>
-          </div>
-          <div class="card-note">원본 Lua를 Euana 내부 바이트코드로 변환합니다. 옵코드·상수 테이블·명령 수를 확인할 수 있습니다.</div>
-          <div class="grid2">
-            <div class="col">
-              <div class="col-h"><span>Source</span><span></span></div>
-              <textarea id="compileSrc">print(1)
-local function f(a,b) return a+b end
-print(f(2,3))</textarea>
-            </div>
-            <div class="col">
-              <div class="col-h"><span>Bytecode dump</span><span></span></div>
-              <pre class="out" id="compileOut">// 컴파일 결과</pre>
-            </div>
-          </div>
-          <div class="status-line" id="compileStatus">Ready</div>
-        </div>
-      </div>
-
-      <!-- DECOMPILE -->
-      <div class="view" id="view-decompile">
-        <div class="panel editor-wrap">
-          <div class="editor-h">
-            <div class="title">디컴파일러 / 구조 분석</div>
-            <div class="tools">
-              <button class="primary" id="goDecomp">분석</button>
-              <label class="file-btn">업로드<input class="hidden-file" type="file" id="fileDecomp" accept=".lua,.txt,.luau,text/plain"></label>
-              <button class="ghost" id="copyDecomp">복사</button>
-            </div>
-          </div>
-          <div class="card-note">Euana로 보호된 스크립트는 원본 복원이 목적이 아니라 <b>구조 휴리스틱 분석</b>입니다. 평문 Lua면 간단 구조 요약을 보여줍니다.</div>
-          <div class="grid2">
-            <div class="col">
-              <div class="col-h"><span>Input</span><span></span></div>
-              <textarea id="decompSrc">-- 난독화된 코드 또는 일반 Lua를 붙여넣으세요</textarea>
-            </div>
-            <div class="col">
-              <div class="col-h"><span>Analysis</span><span></span></div>
-              <pre class="out" id="decompOut">// 분석 결과</pre>
-            </div>
-          </div>
-          <div class="status-line" id="decompStatus">Ready</div>
-        </div>
-      </div>
-
-      <!-- ANALYZE -->
-      <div class="view" id="view-analyze">
-        <div class="panel editor-wrap">
-          <div class="editor-h">
-            <div class="title">코드 분석기</div>
-            <div class="tools">
-              <button class="primary" id="goAnalyze">분석 실행</button>
-              <label class="file-btn">업로드<input class="hidden-file" type="file" id="fileAnalyze" accept=".lua,.txt,.luau,text/plain"></label>
-            </div>
-          </div>
-          <div class="grid2">
-            <div class="col">
-              <div class="col-h"><span>Code</span><span></span></div>
-              <textarea id="analyzeSrc">local x = 1
-for i = 1, 10 do x = x + i end
-print(x)</textarea>
-            </div>
-            <div class="col">
-              <div class="col-h"><span>Report</span><span></span></div>
-              <pre class="out" id="analyzeOut">// 리포트</pre>
-            </div>
-          </div>
-          <div class="status-line" id="analyzeStatus">Ready</div>
-        </div>
-      </div>
-    </section>
+    <footer>Protected by Euana · Bytecode / CF-VM Obfuscator</footer>
   </div>
-  <div class="foot">Protected by Euana · v${VERSION}</div>
 
 <script>
-const tabs = ["obfuscate","compile","decompile","analyze"];
-const titles = {
-  obfuscate: ["EUANA ULTIMATE", "커스텀 바이트코드 VM · 난독화"],
-  compile: ["컴파일러", "Lua 소스 → Euana 바이트코드 IR 덤프"],
-  decompile: ["디컴파일러", "구조 휴리스틱 분석 (완전 원본 복원 보장 없음)"],
-  analyze: ["코드 분석기", "함수/문자열/복잡도 요약"]
+const src = document.getElementById("src");
+const out = document.getElementById("out");
+const iv = document.getElementById("iv");
+const go = document.getElementById("go");
+const status = document.getElementById("status");
+const inLen = document.getElementById("inLen");
+const outLen = document.getElementById("outLen");
+const fileInput = document.getElementById("fileInput");
+
+function updateLens() {
+  inLen.textContent = src.value.length.toLocaleString() + " chars";
+  outLen.textContent = (out.textContent || "").length.toLocaleString() + " chars";
+}
+src.addEventListener("input", updateLens);
+updateLens();
+
+go.onclick = async () => {
+  if (!src.value.trim()) {
+    status.textContent = "Input is empty";
+    status.className = "status err";
+    return;
+  }
+  go.disabled = true;
+  status.textContent = "Obfuscating…";
+  status.className = "status";
+  const t0 = performance.now();
+  try {
+    const r = await fetch("/api/obfuscate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ code: src.value, intensity: iv.value })
+    });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || "Request failed");
+    out.textContent = j.code || "";
+    const ms = Math.round(performance.now() - t0);
+    status.textContent = "Done in " + ms + "ms · " + (j.version || "");
+    status.className = "status ok";
+    updateLens();
+  } catch (e) {
+    status.textContent = String(e.message || e);
+    status.className = "status err";
+  } finally {
+    go.disabled = false;
+  }
 };
 
-function setTab(name) {
-  if (!tabs.includes(name)) name = "obfuscate";
-  document.querySelectorAll(".view").forEach(v => v.classList.remove("active"));
-  const view = document.getElementById("view-" + name);
-  if (view) view.classList.add("active");
-  document.querySelectorAll("[data-tab]").forEach(el => {
-    el.classList.toggle("active", el.getAttribute("data-tab") === name);
-  });
-  const t = titles[name] || titles.obfuscate;
-  document.getElementById("heroTitle").textContent = t[0];
-  document.getElementById("heroDesc").textContent = t[1];
-  try { history.replaceState(null, "", "#" + name); } catch (_) {}
-}
+document.getElementById("copy").onclick = async () => {
+  const t = out.textContent || "";
+  if (!t || t.startsWith("//")) return;
+  try {
+    await navigator.clipboard.writeText(t);
+    status.textContent = "Copied to clipboard";
+    status.className = "status ok";
+  } catch {
+    status.textContent = "Copy failed";
+    status.className = "status err";
+  }
+};
 
-document.querySelectorAll("[data-tab]").forEach(el => {
-  el.addEventListener("click", (e) => {
-    e.preventDefault();
-    setTab(el.getAttribute("data-tab"));
-  });
+document.getElementById("clear").onclick = () => {
+  src.value = "";
+  out.textContent = "// obfuscated code will appear here";
+  status.textContent = "Cleared";
+  status.className = "status";
+  fileInput.value = "";
+  updateLens();
+};
+
+// Upload file → load into input (robust)
+fileInput.addEventListener("change", async () => {
+  const file = fileInput.files && fileInput.files[0];
+  if (!file) return;
+
+  // size guard (10MB)
+  if (file.size > 10 * 1024 * 1024) {
+    status.textContent = "File too large (max 10MB)";
+    status.className = "status err";
+    fileInput.value = "";
+    return;
+  }
+
+  status.textContent = "Reading " + file.name + "…";
+  status.className = "status";
+
+  try {
+    let text = "";
+    // Prefer modern API first
+    if (file.text) {
+      text = await file.text();
+    } else {
+      text = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result || ""));
+        reader.onerror = () => reject(reader.error || new Error("read error"));
+        reader.readAsText(file);
+      });
+    }
+    src.value = text;
+    status.textContent = "Loaded: " + file.name + " (" + text.length.toLocaleString() + " chars)";
+    status.className = "status ok";
+    updateLens();
+  } catch (e) {
+    console.error(e);
+    status.textContent = "Load failed — try a smaller file or desktop browser";
+    status.className = "status err";
+  }
 });
 
-// hash route
-setTab((location.hash || "#obfuscate").slice(1));
-
-function bindFile(inputId, textareaId, statusId) {
-  const input = document.getElementById(inputId);
-  const ta = document.getElementById(textareaId);
-  const st = document.getElementById(statusId);
-  input.addEventListener("change", async () => {
-    const f = input.files && input.files[0];
-    if (!f) return;
-    try {
-      ta.value = f.text ? await f.text() : await new Promise((res,rej)=>{const r=new FileReader();r.onload=()=>res(String(r.result||""));r.onerror=rej;r.readAsText(f);});
-      st.textContent = "로드됨: " + f.name;
-      st.className = "status-line ok";
-    } catch {
-      st.textContent = "파일 로드 실패";
-      st.className = "status-line err";
-    }
-  });
-}
-bindFile("fileObf","obfSrc","obfStatus");
-bindFile("fileCompile","compileSrc","compileStatus");
-bindFile("fileDecomp","decompSrc","decompStatus");
-bindFile("fileAnalyze","analyzeSrc","analyzeStatus");
-
-function setLen() {
-  document.getElementById("obfInLen").textContent = (document.getElementById("obfSrc").value||"").length;
-  document.getElementById("obfOutLen").textContent = (document.getElementById("obfOut").textContent||"").length;
-}
-document.getElementById("obfSrc").addEventListener("input", setLen);
-setLen();
-
-async function postJSON(url, body) {
-  const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-  const j = await r.json();
-  if (!r.ok) throw new Error(j.error || "request failed");
-  return j;
-}
-
-document.getElementById("goObf").onclick = async () => {
-  const src = document.getElementById("obfSrc").value;
-  const st = document.getElementById("obfStatus");
-  const btn = document.getElementById("goObf");
-  btn.disabled = true; st.textContent = "난독화 중…"; st.className = "status-line";
-  try {
-    const j = await postJSON("/api/obfuscate", { code: src, intensity: document.getElementById("iv").value });
-    document.getElementById("obfOut").textContent = j.code || "";
-    st.textContent = "완료 · v" + (j.version || "");
-    st.className = "status-line ok";
-    setLen();
-  } catch (e) {
-    st.textContent = String(e.message || e);
-    st.className = "status-line err";
-  } finally { btn.disabled = false; }
-};
-
-document.getElementById("copyObf").onclick = async () => {
-  const t = document.getElementById("obfOut").textContent || "";
-  if (!t || t.startsWith("//")) return;
-  await navigator.clipboard.writeText(t);
-  document.getElementById("obfStatus").textContent = "복사됨";
-  document.getElementById("obfStatus").className = "status-line ok";
-};
-document.getElementById("dlObf").onclick = () => {
-  const t = document.getElementById("obfOut").textContent || "";
-  if (!t || t.startsWith("//")) return;
+// Download output as .lua file
+document.getElementById("download").onclick = () => {
+  const t = out.textContent || "";
+  if (!t || t.startsWith("//")) {
+    status.textContent = "No output to download";
+    status.className = "status err";
+    return;
+  }
+  const blob = new Blob([t], { type: "text/plain;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
-  a.href = URL.createObjectURL(new Blob([t], { type: "text/plain" }));
+  a.href = url;
   a.download = "euana_obfuscated.lua";
+  document.body.appendChild(a);
   a.click();
-};
-document.getElementById("clrObf").onclick = () => {
-  document.getElementById("obfSrc").value = "";
-  document.getElementById("obfOut").textContent = "// 결과";
-  setLen();
-};
-
-document.getElementById("goCompile").onclick = async () => {
-  const st = document.getElementById("compileStatus");
-  const btn = document.getElementById("goCompile");
-  btn.disabled = true; st.textContent = "컴파일 중…"; st.className = "status-line";
-  try {
-    const j = await postJSON("/api/compile", { code: document.getElementById("compileSrc").value });
-    document.getElementById("compileOut").textContent = j.dump || JSON.stringify(j, null, 2);
-    st.textContent = j.ok ? "컴파일 성공" : "컴파일 실패";
-    st.className = j.ok ? "status-line ok" : "status-line err";
-  } catch (e) {
-    st.textContent = String(e.message || e);
-    st.className = "status-line err";
-  } finally { btn.disabled = false; }
-};
-document.getElementById("copyCompile").onclick = async () => {
-  await navigator.clipboard.writeText(document.getElementById("compileOut").textContent || "");
-};
-
-document.getElementById("goDecomp").onclick = async () => {
-  const st = document.getElementById("decompStatus");
-  const btn = document.getElementById("goDecomp");
-  btn.disabled = true; st.textContent = "분석 중…"; st.className = "status-line";
-  try {
-    const j = await postJSON("/api/decompile", { code: document.getElementById("decompSrc").value });
-    document.getElementById("decompOut").textContent = j.report || "";
-    st.textContent = "분석 완료";
-    st.className = "status-line ok";
-  } catch (e) {
-    st.textContent = String(e.message || e);
-    st.className = "status-line err";
-  } finally { btn.disabled = false; }
-};
-document.getElementById("copyDecomp").onclick = async () => {
-  await navigator.clipboard.writeText(document.getElementById("decompOut").textContent || "");
-};
-
-document.getElementById("goAnalyze").onclick = async () => {
-  const st = document.getElementById("analyzeStatus");
-  const btn = document.getElementById("goAnalyze");
-  btn.disabled = true; st.textContent = "분석 중…"; st.className = "status-line";
-  try {
-    const j = await postJSON("/api/analyze", { code: document.getElementById("analyzeSrc").value });
-    document.getElementById("analyzeOut").textContent = j.report || "";
-    st.textContent = "완료";
-    st.className = "status-line ok";
-  } catch (e) {
-    st.textContent = String(e.message || e);
-    st.className = "status-line err";
-  } finally { btn.disabled = false; }
+  a.remove();
+  URL.revokeObjectURL(url);
+  status.textContent = "Download started";
+  status.className = "status ok";
 };
 </script>
 </body>
 </html>`;
-
-  function analyzeLua(code) {
-    const src = String(code || "");
-    const lines = src.split(/\r?\n/);
-    const fns = (src.match(/\bfunction\b/g) || []).length;
-    const locals = (src.match(/\blocal\b/g) || []).length;
-    const strings = (src.match(/"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'/g) || []).length;
-    const loops = (src.match(/\b(for|while|repeat)\b/g) || []).length;
-    return [
-      "=== Code analysis ===",
-      "lines: " + lines.length,
-      "bytes: " + src.length,
-      "function keywords: " + fns,
-      "local keywords: " + locals,
-      "string literals: " + strings,
-      "loops: " + loops,
-      "complexity: " + (fns + loops > 20 ? "high" : fns + loops > 5 ? "medium" : "low"),
-    ].join("\n");
-  }
-
-  function decompileReport(code) {
-    const src = String(code || "");
-    const lines = [];
-    lines.push("=== Structure analysis ===");
-    if (/Protected by Euana/i.test(src) || /euana-vm\//i.test(src)) {
-      lines.push("detected: Euana protected script");
-      const ver = (src.match(/Euana\s+([\d.]+)/i) || [])[1];
-      const vm = (src.match(/euana-vm\/(\d+)/i) || [])[1];
-      const mode = (src.match(/\|\s*(bytecode|envelope|blocked)/i) || [])[1];
-      if (ver) lines.push("version tag: " + ver);
-      if (vm) lines.push("vm profile: " + vm);
-      if (mode) lines.push("mode: " + mode);
-      lines.push("note: full source recovery is not available (by design).");
-      lines.push("hints: custom VM, encrypted constants/stream, no-plain-source.");
-    } else if (/\b(function|local|end|then)\b/.test(src)) {
-      lines.push("detected: likely plain Lua/Luau text");
-      lines.push(analyzeLua(src));
-      lines.push("");
-      lines.push("--- rough outline ---");
-      src.split(/\r?\n/).slice(0, 40).forEach((l, i) => {
-        if (/\b(function|local function|for|while|if|return)\b/.test(l))
-          lines.push(String(i + 1).padStart(4, " ") + "| " + l.trim());
+  http.createServer((req, res) => {
+    if (req.method === "GET" && req.url === "/") {
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      res.end(html);
+      return;
+    }
+    if (req.method === "POST" && req.url === "/api/obfuscate") {
+      let body = "";
+      req.on("data", (c) => (body += c));
+      req.on("end", () => {
+        try {
+          const j = JSON.parse(body || "{}");
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              code: obfuscateCode(j.code || "", j.intensity || "v3"),
+              version: VERSION,
+            })
+          );
+        } catch (e) {
+          res.writeHead(500);
+          res.end(JSON.stringify({ error: String(e.message || e) }));
+        }
       });
-    } else {
-      lines.push("detected: unknown / heavily transformed blob");
-      lines.push("bytes: " + src.length);
-      lines.push("printable ratio: " + (src.replace(/[^\x20-\x7e\n\r\t]/g, "").length / Math.max(1, src.length)).toFixed(3));
+      return;
     }
-    return lines.join("\n");
-  }
-
-  function compileDump(code) {
-    const src = preprocessLuau(String(code || ""));
-    const result = compileToBytecode(src);
-    if (!result.ok) {
-      return { ok: false, dump: "compile failed:\n" + (result.errors || []).join("\n"), errors: result.errors };
-    }
-    const { code: bc, constants, op } = result;
-    const opNames = {};
-    for (const [k, v] of Object.entries(op)) opNames[v] = k;
-    const lines = [];
-    lines.push("=== Euana bytecode IR ===");
-    lines.push("instructions: " + bc.length);
-    lines.push("constants: " + constants.length);
-    lines.push("");
-    lines.push("-- opcode map --");
-    for (const [k, v] of Object.entries(op)) lines.push("  " + k + " = " + v);
-    lines.push("");
-    lines.push("-- constants --");
-    constants.slice(0, 64).forEach((c, i) => {
-      let s = c === null || c === undefined ? "nil" : typeof c === "string" ? JSON.stringify(c) : String(c);
-      if (s.length > 80) s = s.slice(0, 77) + "...";
-      lines.push("  [" + i + "] " + s);
-    });
-    if (constants.length > 64) lines.push("  ... (" + (constants.length - 64) + " more)");
-    lines.push("");
-    lines.push("-- code --");
-    let i = 0;
-    while (i < bc.length) {
-      const o = bc[i] & 0xffff;
-      const name = opNames[o] || ("OP_" + o);
-      let extra = "";
-      // rough operand display for common ops
-      if (["LOADK","GETGLOBAL","SETGLOBAL","GETLOCAL","SETLOCAL","LOADBOOL","JMP","JMPIF","JMPIFNOT"].includes(name) && i + 1 < bc.length) {
-        extra = " " + (bc[i + 1] & 0xffff);
-        i += 2;
-      } else if (["CALL","CLOSURE"].includes(name) && i + 2 < bc.length) {
-        extra = " " + (bc[i + 1] & 0xffff) + " " + (bc[i + 2] & 0xffff);
-        i += 3;
-      } else {
-        i += 1;
-      }
-      lines.push(String(i).padStart(4, " ") + ": " + name + extra);
-      if (lines.length > 400) {
-        lines.push("... truncated ...");
-        break;
-      }
-    }
-    return { ok: true, dump: lines.join("\n") };
-  }
-
-  http.createServer(async (req, res) => {
-    try {
-      if (req.method === "GET" && (req.url === "/" || req.url.startsWith("/?"))) {
-        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-        res.end(html);
-        return;
-      }
-      if (req.method === "POST" && req.url === "/api/obfuscate") {
-        const body = await readBody(req);
-        const j = JSON.parse(body || "{}");
-        return json(res, 200, { code: obfuscateCode(j.code || "", j.intensity || "v3"), version: VERSION });
-      }
-      if (req.method === "POST" && req.url === "/api/compile") {
-        const body = await readBody(req);
-        const j = JSON.parse(body || "{}");
-        const dump = compileDump(j.code || "");
-        return json(res, 200, { ...dump, version: VERSION });
-      }
-      if (req.method === "POST" && req.url === "/api/decompile") {
-        const body = await readBody(req);
-        const j = JSON.parse(body || "{}");
-        return json(res, 200, { report: decompileReport(j.code || ""), version: VERSION });
-      }
-      if (req.method === "POST" && req.url === "/api/analyze") {
-        const body = await readBody(req);
-        const j = JSON.parse(body || "{}");
-        return json(res, 200, { report: analyzeLua(j.code || ""), version: VERSION });
-      }
-      res.writeHead(404);
-      res.end("not found");
-    } catch (e) {
-      json(res, 500, { error: String(e.message || e) });
-    }
+    res.writeHead(404);
+    res.end("not found");
   }).listen(port, () => console.log("Euana " + VERSION + " :" + port));
 }
 
