@@ -2151,6 +2151,21 @@ function runTests() {
 
 function serve(port) {
   port = Number(port) || Number(process.env.PORT) || 3000;
+
+  function json(res, code, obj) {
+    res.writeHead(code, { "Content-Type": "application/json; charset=utf-8" });
+    res.end(JSON.stringify(obj));
+  }
+
+  function readBody(req) {
+    return new Promise((resolve, reject) => {
+      let body = "";
+      req.on("data", (c) => (body += c));
+      req.on("end", () => resolve(body));
+      req.on("error", reject);
+    });
+  }
+
   const html = `<!DOCTYPE html>
 <html lang="ko">
 <head>
@@ -2159,325 +2174,127 @@ function serve(port) {
 <title>Euana ${VERSION}</title>
 <style>
   :root {
-    --bg0: #07060f;
-    --bg1: #0d0a1a;
-    --bg2: #141022;
-    --panel: rgba(22, 16, 40, 0.92);
-    --panel2: rgba(30, 22, 55, 0.95);
-    --line: rgba(140, 90, 255, 0.28);
-    --line2: rgba(180, 120, 255, 0.45);
-    --text: #f3eefc;
-    --muted: #9b8fb8;
-    --purple: #8b5cf6;
-    --purple2: #a78bfa;
-    --pink: #c084fc;
-    --green: #34d399;
-    --danger: #f87171;
-    --glow: 0 0 24px rgba(139, 92, 246, 0.35);
-    --radius: 14px;
+    --bg0: #07060f; --bg1: #0d0a1a; --panel: rgba(22,16,40,0.94); --panel2: rgba(30,22,55,0.95);
+    --line: rgba(140,90,255,0.28); --line2: rgba(180,120,255,0.45);
+    --text: #f3eefc; --muted: #9b8fb8; --purple: #8b5cf6; --purple2: #a78bfa;
+    --green: #34d399; --danger: #f87171; --glow: 0 0 24px rgba(139,92,246,0.35); --radius: 14px;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
     font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     background:
-      radial-gradient(1200px 600px at 10% -10%, rgba(124, 58, 237, 0.25), transparent 60%),
-      radial-gradient(900px 500px at 90% 0%, rgba(91, 33, 182, 0.2), transparent 55%),
-      linear-gradient(180deg, var(--bg0), var(--bg1) 40%, #0a0814);
-    color: var(--text);
-    min-height: 100vh;
+      radial-gradient(1200px 600px at 10% -10%, rgba(124,58,237,0.25), transparent 60%),
+      radial-gradient(900px 500px at 90% 0%, rgba(91,33,182,0.18), transparent 55%),
+      linear-gradient(180deg, var(--bg0), var(--bg1));
+    color: var(--text); min-height: 100vh;
   }
-  a { color: inherit; text-decoration: none; }
   .topnav {
-    height: 64px;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 0 22px;
-    border-bottom: 1px solid var(--line);
-    background: rgba(10, 8, 20, 0.8);
-    backdrop-filter: blur(12px);
-    position: sticky;
-    top: 0;
-    z-index: 20;
+    height: 64px; display: flex; align-items: center; justify-content: space-between;
+    padding: 0 22px; border-bottom: 1px solid var(--line);
+    background: rgba(10,8,20,0.85); backdrop-filter: blur(12px); position: sticky; top: 0; z-index: 20;
   }
-  .brand {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    font-weight: 800;
-    letter-spacing: 0.04em;
-  }
+  .brand { display: flex; align-items: center; gap: 12px; font-weight: 800; cursor: pointer; }
   .logo {
-    width: 36px; height: 36px;
-    border-radius: 10px;
-    background: linear-gradient(135deg, #7c3aed, #c084fc);
-    box-shadow: var(--glow);
+    width: 36px; height: 36px; border-radius: 10px;
+    background: linear-gradient(135deg,#7c3aed,#c084fc); box-shadow: var(--glow);
     display: grid; place-items: center;
-    font-size: 16px;
   }
-  .brand small {
-    display: block;
-    font-size: 10px;
-    color: var(--muted);
-    font-weight: 600;
-    letter-spacing: 0.12em;
+  .brand small { display: block; font-size: 10px; color: var(--muted); letter-spacing: 0.12em; }
+  .navlinks { display: flex; gap: 6px; flex-wrap: wrap; }
+  .navlinks button {
+    border: 1px solid transparent; background: transparent; color: var(--muted);
+    padding: 8px 14px; border-radius: 999px; font: inherit; font-size: 13px; cursor: pointer;
   }
-  .navlinks {
-    display: flex;
-    gap: 6px;
-    flex-wrap: wrap;
+  .navlinks button.active, .navlinks button:hover {
+    color: #fff; background: rgba(139,92,246,0.2); border-color: var(--line2);
   }
-  .navlinks a {
-    padding: 8px 14px;
-    border-radius: 999px;
-    font-size: 13px;
-    color: var(--muted);
-  }
-  .navlinks a.active, .navlinks a:hover {
-    color: #fff;
-    background: rgba(139, 92, 246, 0.2);
-    border: 1px solid var(--line2);
-  }
-  .status-pill {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    font-size: 12px;
-    color: var(--muted);
-  }
-  .dot {
-    width: 8px; height: 8px; border-radius: 50%;
-    background: var(--green);
-    box-shadow: 0 0 10px var(--green);
-  }
+  .status-pill { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); box-shadow: 0 0 10px var(--green); }
   .layout {
-    display: grid;
-    grid-template-columns: 240px 1fr 320px;
-    gap: 16px;
-    padding: 18px;
-    max-width: 1500px;
-    margin: 0 auto;
+    display: grid; grid-template-columns: 240px 1fr; gap: 16px; padding: 18px;
+    max-width: 1400px; margin: 0 auto;
   }
-  @media (max-width: 1100px) {
-    .layout { grid-template-columns: 1fr; }
-    .side, .right { order: 0; }
-  }
+  @media (max-width: 900px) { .layout { grid-template-columns: 1fr; } }
   .panel {
-    background: var(--panel);
-    border: 1px solid var(--line);
-    border-radius: var(--radius);
+    background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
     box-shadow: 0 10px 40px rgba(0,0,0,0.35);
   }
-  .side {
-    padding: 14px;
-    height: fit-content;
-  }
-  .side h3 {
-    font-size: 12px;
-    color: var(--muted);
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    margin: 8px 8px 12px;
-  }
+  .side { padding: 14px; height: fit-content; }
+  .side h3 { font-size: 12px; color: var(--muted); letter-spacing: 0.08em; margin: 8px 8px 12px; text-transform: uppercase; }
   .menu button {
-    width: 100%;
-    text-align: left;
-    border: 1px solid transparent;
-    background: transparent;
-    color: var(--text);
-    padding: 12px 14px;
-    border-radius: 12px;
-    cursor: pointer;
-    font: inherit;
-    font-size: 13.5px;
-    display: flex;
-    gap: 10px;
-    align-items: center;
-    margin-bottom: 6px;
+    width: 100%; text-align: left; border: 1px solid transparent; background: transparent; color: var(--text);
+    padding: 12px 14px; border-radius: 12px; cursor: pointer; font: inherit; font-size: 13.5px;
+    display: flex; gap: 10px; align-items: center; margin-bottom: 6px;
   }
   .menu button.active, .menu button:hover {
     background: linear-gradient(90deg, rgba(124,58,237,0.35), rgba(124,58,237,0.08));
     border-color: var(--line2);
   }
-  .menu button span.icon {
-    width: 22px; text-align: center; opacity: 0.9;
-  }
   .main { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
   .hero {
-    padding: 22px 24px;
-    background:
-      linear-gradient(120deg, rgba(124,58,237,0.25), transparent 55%),
-      var(--panel);
-    border: 1px solid var(--line);
-    border-radius: var(--radius);
-    display: flex;
-    justify-content: space-between;
-    gap: 16px;
-    align-items: center;
+    padding: 20px 22px; border-radius: var(--radius); border: 1px solid var(--line);
+    background: linear-gradient(120deg, rgba(124,58,237,0.22), transparent 55%), var(--panel);
   }
   .hero h1 {
-    font-size: 1.6rem;
-    font-weight: 800;
-    letter-spacing: -0.02em;
-    background: linear-gradient(90deg, #fff, #c4b5fd);
-    -webkit-background-clip: text;
-    color: transparent;
+    font-size: 1.45rem; font-weight: 800;
+    background: linear-gradient(90deg,#fff,#c4b5fd); -webkit-background-clip: text; color: transparent;
   }
-  .hero p { color: var(--muted); margin-top: 6px; font-size: 13.5px; }
-  .badges { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
-  .badge {
-    font-size: 11px;
-    padding: 5px 10px;
-    border-radius: 999px;
-    border: 1px solid var(--line);
-    color: var(--purple2);
-    background: rgba(139,92,246,0.12);
-  }
-  .editor-wrap { overflow: hidden; display: flex; flex-direction: column; min-height: 480px; }
+  .hero p { color: var(--muted); margin-top: 6px; font-size: 13px; }
+  .view { display: none; }
+  .view.active { display: block; }
+  .editor-wrap { overflow: hidden; }
   .editor-h {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    gap: 10px;
-    padding: 12px 16px;
-    border-bottom: 1px solid var(--line);
-    background: var(--panel2);
-    flex-wrap: wrap;
+    display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap;
+    padding: 12px 16px; border-bottom: 1px solid var(--line); background: var(--panel2);
   }
-  .editor-h .title {
-    font-weight: 700;
-    font-size: 13px;
-    color: var(--purple2);
-  }
+  .editor-h .title { font-weight: 700; font-size: 13px; color: var(--purple2); }
   .tools { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
   select, button, .file-btn {
-    font: inherit;
-    font-size: 12.5px;
-    border-radius: 10px;
-    border: 1px solid var(--line);
-    background: rgba(20, 14, 36, 0.9);
-    color: var(--text);
-    padding: 8px 12px;
-    cursor: pointer;
+    font: inherit; font-size: 12.5px; border-radius: 10px; border: 1px solid var(--line);
+    background: rgba(20,14,36,0.9); color: var(--text); padding: 8px 12px; cursor: pointer;
   }
-  select:hover, button:hover, .file-btn:hover { border-color: var(--line2); }
   button.primary {
-    background: linear-gradient(135deg, #7c3aed, #a855f7);
-    border: none;
-    font-weight: 700;
-    box-shadow: var(--glow);
+    background: linear-gradient(135deg,#7c3aed,#a855f7); border: none; font-weight: 700; box-shadow: var(--glow);
   }
   button.primary:disabled { opacity: 0.55; cursor: not-allowed; box-shadow: none; }
   button.ghost { background: transparent; }
-  .file-btn { display: inline-flex; align-items: center; gap: 6px; }
-  #fileInput { display: none; }
-  .grid2 {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    min-height: 420px;
-  }
+  .file-btn { display: inline-flex; }
+  .hidden-file { display: none; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; min-height: 420px; }
   @media (max-width: 820px) { .grid2 { grid-template-columns: 1fr; } }
-  .col {
-    display: flex;
-    flex-direction: column;
-    border-right: 1px solid var(--line);
-    min-height: 380px;
-  }
+  .col { display: flex; flex-direction: column; border-right: 1px solid var(--line); min-height: 360px; }
   .col:last-child { border-right: none; }
   .col-h {
-    padding: 10px 14px;
-    font-size: 12px;
-    color: var(--muted);
-    border-bottom: 1px solid var(--line);
-    display: flex;
-    justify-content: space-between;
+    padding: 10px 14px; font-size: 12px; color: var(--muted); border-bottom: 1px solid var(--line);
+    display: flex; justify-content: space-between;
   }
-  textarea, pre {
-    flex: 1;
-    width: 100%;
-    min-height: 340px;
-    padding: 14px 16px;
-    background: transparent;
-    border: none;
-    color: var(--text);
-    font-family: "JetBrains Mono", "Fira Code", "SF Mono", Consolas, monospace;
-    font-size: 13px;
-    line-height: 1.55;
-    resize: vertical;
-    outline: none;
+  textarea, pre.out {
+    flex: 1; width: 100%; min-height: 320px; padding: 14px 16px; background: transparent; border: none;
+    color: var(--text); font-family: "JetBrains Mono","Fira Code",Consolas,monospace; font-size: 13px;
+    line-height: 1.55; resize: vertical; outline: none;
   }
-  pre {
-    white-space: pre-wrap;
-    word-break: break-all;
-    overflow: auto;
-    margin: 0;
-    color: #ddd6fe;
-  }
-  .right { padding: 16px; height: fit-content; }
-  .result-card {
-    text-align: center;
-    padding: 22px 12px 16px;
-    border: 1px solid var(--line);
-    border-radius: 12px;
-    background: rgba(124,58,237,0.08);
-    margin-bottom: 14px;
-  }
-  .result-card .check {
-    width: 52px; height: 52px; margin: 0 auto 12px;
-    border-radius: 50%;
-    display: grid; place-items: center;
-    background: rgba(52, 211, 153, 0.15);
-    border: 1px solid rgba(52,211,153,0.4);
-    color: var(--green);
-    font-size: 22px;
-  }
-  .result-card h3 { font-size: 15px; margin-bottom: 6px; }
-  .result-card p { color: var(--muted); font-size: 12.5px; }
-  .stats {
-    display: grid;
-    gap: 8px;
-    margin-top: 8px;
-  }
-  .stat {
-    display: flex;
-    justify-content: space-between;
-    padding: 10px 12px;
-    border-radius: 10px;
-    background: rgba(0,0,0,0.25);
-    border: 1px solid var(--line);
-    font-size: 12.5px;
-  }
-  .stat b { color: var(--purple2); font-weight: 600; }
-  .status-line {
-    margin-top: 12px;
-    font-size: 12px;
-    color: var(--muted);
-    min-height: 18px;
-  }
+  pre.out { white-space: pre-wrap; word-break: break-all; overflow: auto; margin: 0; color: #ddd6fe; }
+  .status-line { padding: 10px 16px; font-size: 12px; color: var(--muted); border-top: 1px solid var(--line); }
   .status-line.ok { color: var(--green); }
   .status-line.err { color: var(--danger); }
-  .foot {
-    text-align: center;
-    color: var(--muted);
-    font-size: 11.5px;
-    padding: 8px 18px 22px;
+  .foot { text-align: center; color: var(--muted); font-size: 11.5px; padding: 10px 18px 22px; }
+  .card-note {
+    margin: 12px 16px 0; padding: 12px 14px; border-radius: 10px; border: 1px solid var(--line);
+    background: rgba(124,58,237,0.1); color: var(--muted); font-size: 12.5px; line-height: 1.5;
   }
 </style>
 </head>
 <body>
   <header class="topnav">
-    <div class="brand">
+    <div class="brand" data-tab="obfuscate">
       <div class="logo">E</div>
-      <div>
-        EUANA
-        <small>ULTIMATE VM</small>
-      </div>
+      <div>EUANA<small>ULTIMATE VM</small></div>
     </div>
     <nav class="navlinks">
-      <a class="active" href="#">홈</a>
-      <a href="#">난독화</a>
-      <a href="#">분석</a>
-      <a href="#">도구</a>
+      <button type="button" data-tab="obfuscate" class="active">난독화</button>
+      <button type="button" data-tab="compile">컴파일러</button>
+      <button type="button" data-tab="decompile">디컴파일러</button>
+      <button type="button" data-tab="analyze">분석기</button>
     </nav>
     <div class="status-pill"><span class="dot"></span> 서버 정상 · v${VERSION}</div>
   </header>
@@ -2486,239 +2303,432 @@ function serve(port) {
     <aside class="panel side">
       <h3>기능 메뉴</h3>
       <div class="menu">
-        <button class="active" type="button"><span class="icon">🔒</span> 난독화</button>
-        <button type="button" disabled style="opacity:.45"><span class="icon">▶</span> 컴파일러</button>
-        <button type="button" disabled style="opacity:.45"><span class="icon">↺</span> 디컴파일러</button>
-        <button type="button" disabled style="opacity:.45"><span class="icon">📊</span> 코드 분석기</button>
-        <button type="button" disabled style="opacity:.45"><span class="icon">🛡</span> VM 보호</button>
+        <button type="button" data-tab="obfuscate" class="active"><span>🔒</span> 난독화</button>
+        <button type="button" data-tab="compile"><span>▶</span> 컴파일러</button>
+        <button type="button" data-tab="decompile"><span>↺</span> 디컴파일러</button>
+        <button type="button" data-tab="analyze"><span>📊</span> 코드 분석기</button>
       </div>
     </aside>
 
     <section class="main">
       <div class="hero">
-        <div>
-          <h1>EUANA ULTIMATE</h1>
-          <p>커스텀 바이트코드 VM · 상수/스트림 암호화 · 원본 소스 평문 제거</p>
-          <div class="badges">
-            <span class="badge">Bytecode VM</span>
-            <span class="badge">100 VM profiles</span>
-            <span class="badge">no-plain-source</span>
-            <span class="badge">v${VERSION}</span>
-          </div>
-        </div>
+        <h1 id="heroTitle">EUANA ULTIMATE</h1>
+        <p id="heroDesc">커스텀 바이트코드 VM · 상수/스트림 암호화 · 원본 소스 평문 제거</p>
       </div>
 
-      <div class="panel editor-wrap">
-        <div class="editor-h">
-          <div class="title">&lt;/&gt; 코드 에디터</div>
-          <div class="tools">
-            <label style="font-size:12px;color:var(--muted)">Intensity</label>
-            <select id="iv">
-              <option value="v1">v1 — Light</option>
-              <option value="v2">v2 — Medium</option>
-              <option value="v3" selected>v3 — Heavy</option>
-            </select>
-            <button class="primary" id="go">난독화 실행</button>
-            <label class="file-btn" for="fileInput">업로드</label>
-            <input type="file" id="fileInput" accept=".lua,.txt,.luau,text/plain">
-            <button class="ghost" id="download">다운로드</button>
-            <button class="ghost" id="copy">복사</button>
-            <button class="ghost" id="clear">초기화</button>
+      <!-- OBFUSCATE -->
+      <div class="view active" id="view-obfuscate">
+        <div class="panel editor-wrap">
+          <div class="editor-h">
+            <div class="title">난독화</div>
+            <div class="tools">
+              <select id="iv">
+                <option value="v1">v1 — Light</option>
+                <option value="v2">v2 — Medium</option>
+                <option value="v3" selected>v3 — Heavy</option>
+              </select>
+              <button class="primary" id="goObf">난독화 실행</button>
+              <label class="file-btn">업로드<input class="hidden-file" type="file" id="fileObf" accept=".lua,.txt,.luau,text/plain"></label>
+              <button class="ghost" id="dlObf">다운로드</button>
+              <button class="ghost" id="copyObf">복사</button>
+              <button class="ghost" id="clrObf">초기화</button>
+            </div>
           </div>
-        </div>
-        <div class="grid2">
-          <div class="col">
-            <div class="col-h"><span>Input (Lua / Luau)</span><span id="inLen">0 chars</span></div>
-            <textarea id="src" spellcheck="false">print("Hello from Euana")
+          <div class="grid2">
+            <div class="col">
+              <div class="col-h"><span>Input</span><span id="obfInLen">0</span></div>
+              <textarea id="obfSrc">print("Hello from Euana")
 local function add(a, b)
   return a + b
 end
 print(add(20, 22))</textarea>
+            </div>
+            <div class="col">
+              <div class="col-h"><span>Output</span><span id="obfOutLen">0</span></div>
+              <pre class="out" id="obfOut">// 결과</pre>
+            </div>
           </div>
-          <div class="col">
-            <div class="col-h"><span>Output</span><span id="outLen">0 chars</span></div>
-            <pre id="out">// 난독화 결과가 여기에 표시됩니다</pre>
+          <div class="status-line" id="obfStatus">Ready</div>
+        </div>
+      </div>
+
+      <!-- COMPILE -->
+      <div class="view" id="view-compile">
+        <div class="panel editor-wrap">
+          <div class="editor-h">
+            <div class="title">컴파일러 (Lua → Euana bytecode IR)</div>
+            <div class="tools">
+              <button class="primary" id="goCompile">컴파일</button>
+              <label class="file-btn">업로드<input class="hidden-file" type="file" id="fileCompile" accept=".lua,.txt,.luau,text/plain"></label>
+              <button class="ghost" id="copyCompile">복사</button>
+            </div>
           </div>
+          <div class="card-note">원본 Lua를 Euana 내부 바이트코드로 변환합니다. 옵코드·상수 테이블·명령 수를 확인할 수 있습니다.</div>
+          <div class="grid2">
+            <div class="col">
+              <div class="col-h"><span>Source</span><span></span></div>
+              <textarea id="compileSrc">print(1)
+local function f(a,b) return a+b end
+print(f(2,3))</textarea>
+            </div>
+            <div class="col">
+              <div class="col-h"><span>Bytecode dump</span><span></span></div>
+              <pre class="out" id="compileOut">// 컴파일 결과</pre>
+            </div>
+          </div>
+          <div class="status-line" id="compileStatus">Ready</div>
+        </div>
+      </div>
+
+      <!-- DECOMPILE -->
+      <div class="view" id="view-decompile">
+        <div class="panel editor-wrap">
+          <div class="editor-h">
+            <div class="title">디컴파일러 / 구조 분석</div>
+            <div class="tools">
+              <button class="primary" id="goDecomp">분석</button>
+              <label class="file-btn">업로드<input class="hidden-file" type="file" id="fileDecomp" accept=".lua,.txt,.luau,text/plain"></label>
+              <button class="ghost" id="copyDecomp">복사</button>
+            </div>
+          </div>
+          <div class="card-note">Euana로 보호된 스크립트는 원본 복원이 목적이 아니라 <b>구조 휴리스틱 분석</b>입니다. 평문 Lua면 간단 구조 요약을 보여줍니다.</div>
+          <div class="grid2">
+            <div class="col">
+              <div class="col-h"><span>Input</span><span></span></div>
+              <textarea id="decompSrc">-- 난독화된 코드 또는 일반 Lua를 붙여넣으세요</textarea>
+            </div>
+            <div class="col">
+              <div class="col-h"><span>Analysis</span><span></span></div>
+              <pre class="out" id="decompOut">// 분석 결과</pre>
+            </div>
+          </div>
+          <div class="status-line" id="decompStatus">Ready</div>
+        </div>
+      </div>
+
+      <!-- ANALYZE -->
+      <div class="view" id="view-analyze">
+        <div class="panel editor-wrap">
+          <div class="editor-h">
+            <div class="title">코드 분석기</div>
+            <div class="tools">
+              <button class="primary" id="goAnalyze">분석 실행</button>
+              <label class="file-btn">업로드<input class="hidden-file" type="file" id="fileAnalyze" accept=".lua,.txt,.luau,text/plain"></label>
+            </div>
+          </div>
+          <div class="grid2">
+            <div class="col">
+              <div class="col-h"><span>Code</span><span></span></div>
+              <textarea id="analyzeSrc">local x = 1
+for i = 1, 10 do x = x + i end
+print(x)</textarea>
+            </div>
+            <div class="col">
+              <div class="col-h"><span>Report</span><span></span></div>
+              <pre class="out" id="analyzeOut">// 리포트</pre>
+            </div>
+          </div>
+          <div class="status-line" id="analyzeStatus">Ready</div>
         </div>
       </div>
     </section>
-
-    <aside class="panel right">
-      <div class="result-card">
-        <div class="check" id="checkIcon">✓</div>
-        <h3 id="resultTitle">대기 중</h3>
-        <p id="resultDesc">코드를 입력한 뒤 난독화를 실행하세요.</p>
-      </div>
-      <div class="stats">
-        <div class="stat"><span>입력 크기</span><b id="stIn">0 B</b></div>
-        <div class="stat"><span>출력 크기</span><b id="stOut">0 B</b></div>
-        <div class="stat"><span>처리 시간</span><b id="stMs">—</b></div>
-        <div class="stat"><span>모드</span><b id="stMode">bytecode</b></div>
-      </div>
-      <div class="status-line" id="status">Ready</div>
-    </aside>
   </div>
-  <div class="foot">Protected by Euana · Custom Bytecode / CF-VM Obfuscator</div>
+  <div class="foot">Protected by Euana · v${VERSION}</div>
 
 <script>
-const src = document.getElementById("src");
-const out = document.getElementById("out");
-const iv = document.getElementById("iv");
-const go = document.getElementById("go");
-const status = document.getElementById("status");
-const inLen = document.getElementById("inLen");
-const outLen = document.getElementById("outLen");
-const fileInput = document.getElementById("fileInput");
+const tabs = ["obfuscate","compile","decompile","analyze"];
+const titles = {
+  obfuscate: ["EUANA ULTIMATE", "커스텀 바이트코드 VM · 난독화"],
+  compile: ["컴파일러", "Lua 소스 → Euana 바이트코드 IR 덤프"],
+  decompile: ["디컴파일러", "구조 휴리스틱 분석 (완전 원본 복원 보장 없음)"],
+  analyze: ["코드 분석기", "함수/문자열/복잡도 요약"]
+};
 
-function updateLens() {
-  inLen.textContent = src.value.length.toLocaleString() + " chars";
-  outLen.textContent = (out.textContent || "").length.toLocaleString() + " chars";
-  document.getElementById("stIn").textContent = src.value.length.toLocaleString() + " B";
-  document.getElementById("stOut").textContent = (out.textContent || "").length.toLocaleString() + " B";
+function setTab(name) {
+  if (!tabs.includes(name)) name = "obfuscate";
+  document.querySelectorAll(".view").forEach(v => v.classList.remove("active"));
+  const view = document.getElementById("view-" + name);
+  if (view) view.classList.add("active");
+  document.querySelectorAll("[data-tab]").forEach(el => {
+    el.classList.toggle("active", el.getAttribute("data-tab") === name);
+  });
+  const t = titles[name] || titles.obfuscate;
+  document.getElementById("heroTitle").textContent = t[0];
+  document.getElementById("heroDesc").textContent = t[1];
+  try { history.replaceState(null, "", "#" + name); } catch (_) {}
 }
-src.addEventListener("input", updateLens);
-updateLens();
 
-go.onclick = async () => {
-  if (!src.value.trim()) {
-    status.textContent = "입력이 비어 있습니다";
-    status.className = "status-line err";
-    return;
-  }
-  go.disabled = true;
-  status.textContent = "난독화 중…";
-  status.className = "status-line";
-  document.getElementById("resultTitle").textContent = "처리 중";
-  document.getElementById("resultDesc").textContent = "VM 프로파일 선택 및 암호화 진행 중";
-  const t0 = performance.now();
-  try {
-    const r = await fetch("/api/obfuscate", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ code: src.value, intensity: iv.value })
-    });
-    const j = await r.json();
-    if (!r.ok) throw new Error(j.error || "Request failed");
-    out.textContent = j.code || "";
-    const ms = Math.round(performance.now() - t0);
-    document.getElementById("stMs").textContent = ms + " ms";
-    const mode = ((j.code || "").match(/\\|\\s*(\\w+)\\s*\\|\\s*no-plain-source/) || [])[1] || "bytecode";
-    document.getElementById("stMode").textContent = mode;
-    status.textContent = "완료 · " + ms + "ms · v" + (j.version || "");
-    status.className = "status-line ok";
-    document.getElementById("resultTitle").textContent = "난독화 완료";
-    document.getElementById("resultDesc").textContent = "원본 소스 평문 없이 보호된 코드를 생성했습니다.";
-    document.getElementById("checkIcon").textContent = "✓";
-    updateLens();
-  } catch (e) {
-    status.textContent = String(e.message || e);
-    status.className = "status-line err";
-    document.getElementById("resultTitle").textContent = "실패";
-    document.getElementById("resultDesc").textContent = String(e.message || e);
-    document.getElementById("checkIcon").textContent = "!";
-  } finally {
-    go.disabled = false;
-  }
-};
-
-document.getElementById("copy").onclick = async () => {
-  const t = out.textContent || "";
-  if (!t || t.startsWith("//")) return;
-  try {
-    await navigator.clipboard.writeText(t);
-    status.textContent = "클립보드에 복사됨";
-    status.className = "status-line ok";
-  } catch {
-    status.textContent = "복사 실패";
-    status.className = "status-line err";
-  }
-};
-
-document.getElementById("clear").onclick = () => {
-  src.value = "";
-  out.textContent = "// 난독화 결과가 여기에 표시됩니다";
-  status.textContent = "초기화됨";
-  status.className = "status-line";
-  fileInput.value = "";
-  updateLens();
-};
-
-fileInput.addEventListener("change", async () => {
-  const file = fileInput.files && fileInput.files[0];
-  if (!file) return;
-  if (file.size > 10 * 1024 * 1024) {
-    status.textContent = "파일이 너무 큽니다 (max 10MB)";
-    status.className = "status-line err";
-    return;
-  }
-  status.textContent = "읽는 중…";
-  try {
-    const text = file.text ? await file.text() : await new Promise((res, rej) => {
-      const r = new FileReader();
-      r.onload = () => res(String(r.result || ""));
-      r.onerror = () => rej(r.error);
-      r.readAsText(file);
-    });
-    src.value = text;
-    status.textContent = "로드됨: " + file.name;
-    status.className = "status-line ok";
-    updateLens();
-  } catch (e) {
-    status.textContent = "로드 실패";
-    status.className = "status-line err";
-  }
+document.querySelectorAll("[data-tab]").forEach(el => {
+  el.addEventListener("click", (e) => {
+    e.preventDefault();
+    setTab(el.getAttribute("data-tab"));
+  });
 });
 
-document.getElementById("download").onclick = () => {
-  const t = out.textContent || "";
-  if (!t || t.startsWith("//")) {
-    status.textContent = "다운로드할 출력이 없습니다";
-    status.className = "status-line err";
-    return;
-  }
-  const blob = new Blob([t], { type: "text/plain;charset=utf-8" });
-  const url = URL.createObjectURL(blob);
+// hash route
+setTab((location.hash || "#obfuscate").slice(1));
+
+function bindFile(inputId, textareaId, statusId) {
+  const input = document.getElementById(inputId);
+  const ta = document.getElementById(textareaId);
+  const st = document.getElementById(statusId);
+  input.addEventListener("change", async () => {
+    const f = input.files && input.files[0];
+    if (!f) return;
+    try {
+      ta.value = f.text ? await f.text() : await new Promise((res,rej)=>{const r=new FileReader();r.onload=()=>res(String(r.result||""));r.onerror=rej;r.readAsText(f);});
+      st.textContent = "로드됨: " + f.name;
+      st.className = "status-line ok";
+    } catch {
+      st.textContent = "파일 로드 실패";
+      st.className = "status-line err";
+    }
+  });
+}
+bindFile("fileObf","obfSrc","obfStatus");
+bindFile("fileCompile","compileSrc","compileStatus");
+bindFile("fileDecomp","decompSrc","decompStatus");
+bindFile("fileAnalyze","analyzeSrc","analyzeStatus");
+
+function setLen() {
+  document.getElementById("obfInLen").textContent = (document.getElementById("obfSrc").value||"").length;
+  document.getElementById("obfOutLen").textContent = (document.getElementById("obfOut").textContent||"").length;
+}
+document.getElementById("obfSrc").addEventListener("input", setLen);
+setLen();
+
+async function postJSON(url, body) {
+  const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error || "request failed");
+  return j;
+}
+
+document.getElementById("goObf").onclick = async () => {
+  const src = document.getElementById("obfSrc").value;
+  const st = document.getElementById("obfStatus");
+  const btn = document.getElementById("goObf");
+  btn.disabled = true; st.textContent = "난독화 중…"; st.className = "status-line";
+  try {
+    const j = await postJSON("/api/obfuscate", { code: src, intensity: document.getElementById("iv").value });
+    document.getElementById("obfOut").textContent = j.code || "";
+    st.textContent = "완료 · v" + (j.version || "");
+    st.className = "status-line ok";
+    setLen();
+  } catch (e) {
+    st.textContent = String(e.message || e);
+    st.className = "status-line err";
+  } finally { btn.disabled = false; }
+};
+
+document.getElementById("copyObf").onclick = async () => {
+  const t = document.getElementById("obfOut").textContent || "";
+  if (!t || t.startsWith("//")) return;
+  await navigator.clipboard.writeText(t);
+  document.getElementById("obfStatus").textContent = "복사됨";
+  document.getElementById("obfStatus").className = "status-line ok";
+};
+document.getElementById("dlObf").onclick = () => {
+  const t = document.getElementById("obfOut").textContent || "";
+  if (!t || t.startsWith("//")) return;
   const a = document.createElement("a");
-  a.href = url;
+  a.href = URL.createObjectURL(new Blob([t], { type: "text/plain" }));
   a.download = "euana_obfuscated.lua";
-  document.body.appendChild(a);
   a.click();
-  a.remove();
-  URL.revokeObjectURL(url);
-  status.textContent = "다운로드 시작";
-  status.className = "status-line ok";
+};
+document.getElementById("clrObf").onclick = () => {
+  document.getElementById("obfSrc").value = "";
+  document.getElementById("obfOut").textContent = "// 결과";
+  setLen();
+};
+
+document.getElementById("goCompile").onclick = async () => {
+  const st = document.getElementById("compileStatus");
+  const btn = document.getElementById("goCompile");
+  btn.disabled = true; st.textContent = "컴파일 중…"; st.className = "status-line";
+  try {
+    const j = await postJSON("/api/compile", { code: document.getElementById("compileSrc").value });
+    document.getElementById("compileOut").textContent = j.dump || JSON.stringify(j, null, 2);
+    st.textContent = j.ok ? "컴파일 성공" : "컴파일 실패";
+    st.className = j.ok ? "status-line ok" : "status-line err";
+  } catch (e) {
+    st.textContent = String(e.message || e);
+    st.className = "status-line err";
+  } finally { btn.disabled = false; }
+};
+document.getElementById("copyCompile").onclick = async () => {
+  await navigator.clipboard.writeText(document.getElementById("compileOut").textContent || "");
+};
+
+document.getElementById("goDecomp").onclick = async () => {
+  const st = document.getElementById("decompStatus");
+  const btn = document.getElementById("goDecomp");
+  btn.disabled = true; st.textContent = "분석 중…"; st.className = "status-line";
+  try {
+    const j = await postJSON("/api/decompile", { code: document.getElementById("decompSrc").value });
+    document.getElementById("decompOut").textContent = j.report || "";
+    st.textContent = "분석 완료";
+    st.className = "status-line ok";
+  } catch (e) {
+    st.textContent = String(e.message || e);
+    st.className = "status-line err";
+  } finally { btn.disabled = false; }
+};
+document.getElementById("copyDecomp").onclick = async () => {
+  await navigator.clipboard.writeText(document.getElementById("decompOut").textContent || "");
+};
+
+document.getElementById("goAnalyze").onclick = async () => {
+  const st = document.getElementById("analyzeStatus");
+  const btn = document.getElementById("goAnalyze");
+  btn.disabled = true; st.textContent = "분석 중…"; st.className = "status-line";
+  try {
+    const j = await postJSON("/api/analyze", { code: document.getElementById("analyzeSrc").value });
+    document.getElementById("analyzeOut").textContent = j.report || "";
+    st.textContent = "완료";
+    st.className = "status-line ok";
+  } catch (e) {
+    st.textContent = String(e.message || e);
+    st.className = "status-line err";
+  } finally { btn.disabled = false; }
 };
 </script>
 </body>
 </html>`;
-  http.createServer((req, res) => {
-    if (req.method === "GET" && req.url === "/") {
-      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-      res.end(html);
-      return;
-    }
-    if (req.method === "POST" && req.url === "/api/obfuscate") {
-      let body = "";
-      req.on("data", (c) => (body += c));
-      req.on("end", () => {
-        try {
-          const j = JSON.parse(body || "{}");
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(
-            JSON.stringify({
-              code: obfuscateCode(j.code || "", j.intensity || "v3"),
-              version: VERSION,
-            })
-          );
-        } catch (e) {
-          res.writeHead(500);
-          res.end(JSON.stringify({ error: String(e.message || e) }));
-        }
+
+  function analyzeLua(code) {
+    const src = String(code || "");
+    const lines = src.split(/\r?\n/);
+    const fns = (src.match(/\bfunction\b/g) || []).length;
+    const locals = (src.match(/\blocal\b/g) || []).length;
+    const strings = (src.match(/"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'/g) || []).length;
+    const loops = (src.match(/\b(for|while|repeat)\b/g) || []).length;
+    return [
+      "=== Code analysis ===",
+      "lines: " + lines.length,
+      "bytes: " + src.length,
+      "function keywords: " + fns,
+      "local keywords: " + locals,
+      "string literals: " + strings,
+      "loops: " + loops,
+      "complexity: " + (fns + loops > 20 ? "high" : fns + loops > 5 ? "medium" : "low"),
+    ].join("\n");
+  }
+
+  function decompileReport(code) {
+    const src = String(code || "");
+    const lines = [];
+    lines.push("=== Structure analysis ===");
+    if (/Protected by Euana/i.test(src) || /euana-vm\//i.test(src)) {
+      lines.push("detected: Euana protected script");
+      const ver = (src.match(/Euana\s+([\d.]+)/i) || [])[1];
+      const vm = (src.match(/euana-vm\/(\d+)/i) || [])[1];
+      const mode = (src.match(/\|\s*(bytecode|envelope|blocked)/i) || [])[1];
+      if (ver) lines.push("version tag: " + ver);
+      if (vm) lines.push("vm profile: " + vm);
+      if (mode) lines.push("mode: " + mode);
+      lines.push("note: full source recovery is not available (by design).");
+      lines.push("hints: custom VM, encrypted constants/stream, no-plain-source.");
+    } else if (/\b(function|local|end|then)\b/.test(src)) {
+      lines.push("detected: likely plain Lua/Luau text");
+      lines.push(analyzeLua(src));
+      lines.push("");
+      lines.push("--- rough outline ---");
+      src.split(/\r?\n/).slice(0, 40).forEach((l, i) => {
+        if (/\b(function|local function|for|while|if|return)\b/.test(l))
+          lines.push(String(i + 1).padStart(4, " ") + "| " + l.trim());
       });
-      return;
+    } else {
+      lines.push("detected: unknown / heavily transformed blob");
+      lines.push("bytes: " + src.length);
+      lines.push("printable ratio: " + (src.replace(/[^\x20-\x7e\n\r\t]/g, "").length / Math.max(1, src.length)).toFixed(3));
     }
-    res.writeHead(404);
-    res.end("not found");
+    return lines.join("\n");
+  }
+
+  function compileDump(code) {
+    const src = preprocessLuau(String(code || ""));
+    const result = compileToBytecode(src);
+    if (!result.ok) {
+      return { ok: false, dump: "compile failed:\n" + (result.errors || []).join("\n"), errors: result.errors };
+    }
+    const { code: bc, constants, op } = result;
+    const opNames = {};
+    for (const [k, v] of Object.entries(op)) opNames[v] = k;
+    const lines = [];
+    lines.push("=== Euana bytecode IR ===");
+    lines.push("instructions: " + bc.length);
+    lines.push("constants: " + constants.length);
+    lines.push("");
+    lines.push("-- opcode map --");
+    for (const [k, v] of Object.entries(op)) lines.push("  " + k + " = " + v);
+    lines.push("");
+    lines.push("-- constants --");
+    constants.slice(0, 64).forEach((c, i) => {
+      let s = c === null || c === undefined ? "nil" : typeof c === "string" ? JSON.stringify(c) : String(c);
+      if (s.length > 80) s = s.slice(0, 77) + "...";
+      lines.push("  [" + i + "] " + s);
+    });
+    if (constants.length > 64) lines.push("  ... (" + (constants.length - 64) + " more)");
+    lines.push("");
+    lines.push("-- code --");
+    let i = 0;
+    while (i < bc.length) {
+      const o = bc[i] & 0xffff;
+      const name = opNames[o] || ("OP_" + o);
+      let extra = "";
+      // rough operand display for common ops
+      if (["LOADK","GETGLOBAL","SETGLOBAL","GETLOCAL","SETLOCAL","LOADBOOL","JMP","JMPIF","JMPIFNOT"].includes(name) && i + 1 < bc.length) {
+        extra = " " + (bc[i + 1] & 0xffff);
+        i += 2;
+      } else if (["CALL","CLOSURE"].includes(name) && i + 2 < bc.length) {
+        extra = " " + (bc[i + 1] & 0xffff) + " " + (bc[i + 2] & 0xffff);
+        i += 3;
+      } else {
+        i += 1;
+      }
+      lines.push(String(i).padStart(4, " ") + ": " + name + extra);
+      if (lines.length > 400) {
+        lines.push("... truncated ...");
+        break;
+      }
+    }
+    return { ok: true, dump: lines.join("\n") };
+  }
+
+  http.createServer(async (req, res) => {
+    try {
+      if (req.method === "GET" && (req.url === "/" || req.url.startsWith("/?"))) {
+        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+        res.end(html);
+        return;
+      }
+      if (req.method === "POST" && req.url === "/api/obfuscate") {
+        const body = await readBody(req);
+        const j = JSON.parse(body || "{}");
+        return json(res, 200, { code: obfuscateCode(j.code || "", j.intensity || "v3"), version: VERSION });
+      }
+      if (req.method === "POST" && req.url === "/api/compile") {
+        const body = await readBody(req);
+        const j = JSON.parse(body || "{}");
+        const dump = compileDump(j.code || "");
+        return json(res, 200, { ...dump, version: VERSION });
+      }
+      if (req.method === "POST" && req.url === "/api/decompile") {
+        const body = await readBody(req);
+        const j = JSON.parse(body || "{}");
+        return json(res, 200, { report: decompileReport(j.code || ""), version: VERSION });
+      }
+      if (req.method === "POST" && req.url === "/api/analyze") {
+        const body = await readBody(req);
+        const j = JSON.parse(body || "{}");
+        return json(res, 200, { report: analyzeLua(j.code || ""), version: VERSION });
+      }
+      res.writeHead(404);
+      res.end("not found");
+    } catch (e) {
+      json(res, 500, { error: String(e.message || e) });
+    }
   }).listen(port, () => console.log("Euana " + VERSION + " :" + port));
 }
 
