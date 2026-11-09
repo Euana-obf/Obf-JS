@@ -1029,25 +1029,38 @@ function packProgram(code, constants, key) {
       let s = Buffer.from(String(c), "utf8");
       // per-constant XOR using key + index
       let st = (key[ci % key.length] + ci * 131) >>> 0;
+      const sA = (key._saltA >>> 0) || 0;
+      const sB = (key._saltB >>> 0) || 0;
+      st = (st + sA + sB) >>> 0;
       for (let j = 0; j < s.length; j++) {
         st = (Math.imul(st, 1664525) + 1013904223) >>> 0;
-        s[j] ^= (st >>> 16) & 0xff;
+        let k1 = (st >>> 16) & 0xff;
+        st = (Math.imul(st, 1664525) + 1013904223) >>> 0;
+        let k2 = (st >>> 16) & 0xff;
+        s[j] ^= k1 ^ k2;
       }
       parts.push(Buffer.from([2, s.length & 0xff, (s.length >> 8) & 0xff]), s);
     } else {
       let s = Buffer.from(String(c), "utf8");
       let st = (key[ci % key.length] + ci * 131) >>> 0;
+      const sA = (key._saltA >>> 0) || 0;
+      const sB = (key._saltB >>> 0) || 0;
+      st = (st + sA + sB) >>> 0;
       for (let j = 0; j < s.length; j++) {
         st = (Math.imul(st, 1664525) + 1013904223) >>> 0;
-        s[j] ^= (st >>> 16) & 0xff;
+        let k1 = (st >>> 16) & 0xff;
+        st = (Math.imul(st, 1664525) + 1013904223) >>> 0;
+        let k2 = (st >>> 16) & 0xff;
+        s[j] ^= k1 ^ k2;
       }
       parts.push(Buffer.from([3, s.length & 0xff, (s.length >> 8) & 0xff]), s);
     }
   }
-  // Encrypt each code word with fixed keystream
+  // Encrypt each code word; mixMul from VM profile
+  const mixMul = (key._mixMul >>> 0) || 0x9e3779b9;
   for (let ci = 0; ci < code.length; ci++) {
     let v = code[ci] & 0xffff;
-    let st = (key[ci % 16] ^ ((ci * 0x9e3779b9) >>> 0)) >>> 0;
+    let st = (key[ci % 16] ^ (Math.imul(ci, mixMul) >>> 0)) >>> 0;
     st = (Math.imul(st, 1664525) + 1013904223) >>> 0;
     const mask = (st >>> 16) & 0xffff;
     v = (v ^ mask) & 0xffff;
@@ -1095,17 +1108,26 @@ function emitBcVm(blob, alph, pad, keyMat, op) {
   const seedName = randIdent(10);
   const saltNameA = randIdent(8);
   const saltNameB = randIdent(8);
-  // split seed into ASCII fragments; store as hex pairs so file encoding cannot corrupt
+  // split seed hex into fragments; each byte XOR-masked so concat alone != seed
   const seedHex = Buffer.from(seedStr, "utf8").toString("hex"); // only 0-9a-f
-  const nFrag = 3 + randInt(0, 1);
+  const nFrag = 4 + randInt(0, 2); // 4–6 fragments
   const fragSize = Math.ceil(seedHex.length / nFrag);
+  const seedMask = randInt(1, 255);
   const seedFrags = [];
   for (let i = 0; i < seedHex.length; i += fragSize) {
-    seedFrags.push(seedHex.slice(i, i + fragSize));
+    const raw = seedHex.slice(i, i + fragSize);
+    let masked = "";
+    const hexChars = "0123456789abcdef";
+    for (let j = 0; j < raw.length; j++) {
+      // global nibble index so Lua unmask (mx+i-1)%16 matches
+      const gi = i + j;
+      const v = parseInt(raw[j], 16) ^ ((seedMask + gi) & 15);
+      masked += hexChars[v & 15];
+    }
+    seedFrags.push(masked);
   }
   const fragNames = seedFrags.map(() => randIdent(7));
-  const maskName = randIdent(7); // unused, keep for template compat
-  const seedMask = 0;
+  const maskName = randIdent(7);
   function escLuaStr(s) {
     return s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
   }
@@ -1161,6 +1183,14 @@ local r,p=0,1
 for _=1,8 do local ba,bb=a%2,b%2 r=r+((ba+bb)%2)*p a=math.floor(a/2) b=math.floor(b/2) p=p*2 end
 return r
 end
+local function ${randIdent(9)}(blob,alpha,key,pad)
+-- decoy decoder (wrong LCG) — traps naive reimplementation
+local base=#alpha local idx={}
+for i=1,base do idx[alpha:sub(i,i)]=i-1 end
+local out={}
+for i=1,math.min(32,#blob) do out[i]=(blob:byte(i) or 0) end
+return out
+end
 local function ${N.dec}(blob,alpha,key,pad)
 local base=#alpha local idx={}
 for i=1,base do idx[alpha:sub(i,i)]=i-1 end
@@ -1194,6 +1224,18 @@ ${fragNames.map((fn,i)=>`local ${fn}="${escLuaStr(seedFrags[i])}"`).join("\n")}
 local ${seedName}=${fragNames.join("..")}
 do
 local h=${seedName}
+local mx=${maskName}
+local hexc="0123456789abcdef"
+local inv={}
+for i=0,15 do inv[hexc:sub(i+1,i+1)]=i end
+local plain={}
+for i=1,#h do
+local ch=h:sub(i,i)
+local v=inv[ch] or 0
+v=${N.bx}(v,(mx+i-1)%16)
+plain[i]=hexc:sub(v+1,v+1)
+end
+h=table.concat(plain)
 local t={}
 for i=1,#h/2 do
 local byte=tonumber(h:sub(i*2-1,i*2),16)
@@ -1237,13 +1279,16 @@ if c.t==1 then return c.v end
 if c.d~=nil then return c.d end
 local enc=c.e
 local st=(${keyName}[((c.i-1)%#${keyName})+1]+(c.i-1)*131)%4294967296
+st=(st+${saltNameA}+${saltNameB})%4294967296
 local chars={}
 for j=1,#enc do
 st=(st*1664525+1013904223)%4294967296
-chars[j]=string.char(${N.bx}(enc[j],math.floor(st/65536)%256))
+local k1=math.floor(st/65536)%256
+st=(st*1664525+1013904223)%4294967296
+local k2=math.floor(st/65536)%256
+chars[j]=string.char(${N.bx}(${N.bx}(enc[j],k1),k2))
 end
 local s=table.concat(chars)
--- light integrity: length must match; frustrates partial patching
 if #s~=#enc then return nil end
 if c.t==2 then c.d=tonumber(s) else c.d=s end
 return c.d
@@ -1262,13 +1307,24 @@ if _c and _c.e then _z=_z+#_c.e end
 end
 if _z<0 then while true do end end
 end
+local function ${N.code}_umul(a,b)
+a=a%4294967296 b=b%4294967296
+local a0,a1=a%65536,math.floor(a/65536)%65536
+local b0,b1=b%65536,math.floor(b/65536)%65536
+local p0=a0*b0
+local p1=a0*b1+a1*b0
+return (p0+(p1%65536)*65536)%4294967296
+end
 local function ${N.code}_at(i)
 local v=${N.code}[i]
 if not v then return 0 end
 local kb=${keyName}[((i-1)%#${keyName})+1]
-local mix=((i-1)*0x9E3779B9)%4294967296
+local mix=${N.code}_umul((i-1),${mixMul})
 local st=(mix - mix%256 + ${N.bx}(kb,mix%256))%4294967296
-st=(st*1664525+1013904223)%4294967296
+local s0,s1=st%65536,math.floor(st/65536)%65536
+local m0,m1=1664525%65536,math.floor(1664525/65536)%65536
+local p0=s0*m0 local p1=s0*m1+s1*m0
+st=(p0+(p1%65536)*65536+1013904223)%4294967296
 local mask=math.floor(st/65536)%65536
 local lo=${N.bx}(v%256,mask%256)
 local hi=${N.bx}(math.floor(v/256)%256,math.floor(mask/256)%256)
@@ -1498,7 +1554,7 @@ function emitBytecodeObfuscation(src, intensity) {
   let { code, constants, op } = result;
 
   // Heavy noise — real constants buried among many fakes
-  const noise = { v1: 8, v2: 18, v3: 36 }[intensity] || 18;
+  const noise = { v1: 16, v2: 32, v3: 64 }[intensity] || 32;
   for (let i = 0; i < noise; i++) {
     constants.push(randInt(0x1000, 0xffffff));
     constants.push(randIdent(randInt(6, 14)));
@@ -1531,17 +1587,16 @@ function emitBytecodeObfuscation(src, intensity) {
   // Remap code LOADK indices — skip for now (would need full remap). Keep original order + trailing noise.
   constants = result.constants.concat(noiseConsts);
 
-  // Pick one of ~100 VM profiles (mixMul x shell; LCG coeffs stay IEEE-safe)
+  // Pick one of ~100 VM profiles
   const variant = randInt(0, 99);
   const MIX_MULS = [
     0x9e3779b9, 0x6c078965, 0x85ebca6b, 0xc2b2ae35, 0x27d4eb2d,
     0x165667b1, 0x94d049bb, 0x7f4a7c15, 0x5bd1e995, 0x1b873593
   ];
-  // only small LCG multipliers safe in Lua double * then % 2^32
-  const mixMul = 0x9e3779b9;
+  const mixMul = MIX_MULS[variant % 10];
   const mixA = 1664525;
   const mixB = 1013904223;
-  const shell = Math.floor(variant / 10) % 10; // structural shell 0..9
+  const shell = Math.floor(variant / 10) % 10;
 
   const seedStr = crypto.randomBytes(32).toString("base64");
   const saltA = randInt(1, 0x7fffffff);
@@ -1552,6 +1607,9 @@ function emitBytecodeObfuscation(src, intensity) {
     ds = (Math.imul(ds ^ seedStr.charCodeAt(i % seedStr.length), 1664525) + 1013904223) >>> 0;
     key[i] = (ds >>> ((i % 4) * 8)) & 0xff;
   }
+  key._mixMul = mixMul;
+  key._saltA = saltA;
+  key._saltB = saltB;
   const packed = packProgram(code, constants, key);
   const enc = encodeBc(packed, key);
   const { b85: blob, alph, pad } = b85(enc);
@@ -1567,7 +1625,7 @@ function emitBytecodeObfuscation(src, intensity) {
  */
 
 const APP_NAME = "Euana";
-const VERSION = "4.1.0";
+const VERSION = "5.0.0";
 
 function randInt(a, b) {
   return a + Math.floor(Math.random() * (b - a + 1));
@@ -2090,6 +2148,7 @@ function runTests() {
   console.log(pass + " pass / " + fail + " fail");
   process.exit(fail ? 1 : 0);
 }
+
 function serve(port) {
   port = Number(port) || Number(process.env.PORT) || 3000;
   const html = `<!DOCTYPE html>
@@ -2100,104 +2159,249 @@ function serve(port) {
 <title>Euana ${VERSION}</title>
 <style>
   :root {
-    --bg: #0b0f19;
-    --surface: #121826;
-    --surface2: #1a2234;
-    --border: #2a3548;
-    --text: #e8eef8;
-    --muted: #8b9bb4;
-    --accent: #6c8cff;
-    --accent2: #a78bfa;
-    --success: #34d399;
+    --bg0: #07060f;
+    --bg1: #0d0a1a;
+    --bg2: #141022;
+    --panel: rgba(22, 16, 40, 0.92);
+    --panel2: rgba(30, 22, 55, 0.95);
+    --line: rgba(140, 90, 255, 0.28);
+    --line2: rgba(180, 120, 255, 0.45);
+    --text: #f3eefc;
+    --muted: #9b8fb8;
+    --purple: #8b5cf6;
+    --purple2: #a78bfa;
+    --pink: #c084fc;
+    --green: #34d399;
     --danger: #f87171;
-    --radius: 12px;
+    --glow: 0 0 24px rgba(139, 92, 246, 0.35);
+    --radius: 14px;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
-    background: var(--bg);
+    font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background:
+      radial-gradient(1200px 600px at 10% -10%, rgba(124, 58, 237, 0.25), transparent 60%),
+      radial-gradient(900px 500px at 90% 0%, rgba(91, 33, 182, 0.2), transparent 55%),
+      linear-gradient(180deg, var(--bg0), var(--bg1) 40%, #0a0814);
     color: var(--text);
     min-height: 100vh;
-    line-height: 1.5;
   }
-  .wrap {
-    max-width: 1100px;
-    margin: 0 auto;
-    padding: 32px 20px 60px;
-  }
-  header {
+  a { color: inherit; text-decoration: none; }
+  .topnav {
+    height: 64px;
     display: flex;
     align-items: center;
     justify-content: space-between;
-    margin-bottom: 28px;
-    flex-wrap: wrap;
-    gap: 12px;
+    padding: 0 22px;
+    border-bottom: 1px solid var(--line);
+    background: rgba(10, 8, 20, 0.8);
+    backdrop-filter: blur(12px);
+    position: sticky;
+    top: 0;
+    z-index: 20;
   }
   .brand {
     display: flex;
     align-items: center;
     gap: 12px;
+    font-weight: 800;
+    letter-spacing: 0.04em;
   }
   .logo {
-    width: 40px;
-    height: 40px;
+    width: 36px; height: 36px;
     border-radius: 10px;
-    background: linear-gradient(135deg, var(--accent), var(--accent2));
-    display: grid;
-    place-items: center;
-    font-weight: 800;
-    font-size: 18px;
-    color: #fff;
+    background: linear-gradient(135deg, #7c3aed, #c084fc);
+    box-shadow: var(--glow);
+    display: grid; place-items: center;
+    font-size: 16px;
   }
-  h1 {
-    font-size: 1.45rem;
-    font-weight: 700;
-    letter-spacing: -0.02em;
-  }
-  .ver {
-    font-size: 0.8rem;
+  .brand small {
+    display: block;
+    font-size: 10px;
     color: var(--muted);
-    background: var(--surface2);
-    padding: 3px 9px;
-    border-radius: 999px;
-    border: 1px solid var(--border);
+    font-weight: 600;
+    letter-spacing: 0.12em;
   }
-  .grid {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 18px;
-  }
-  @media (max-width: 820px) {
-    .grid { grid-template-columns: 1fr; }
-  }
-  .card {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    overflow: hidden;
+  .navlinks {
     display: flex;
-    flex-direction: column;
+    gap: 6px;
+    flex-wrap: wrap;
   }
-  .card-h {
-    padding: 12px 16px;
-    border-bottom: 1px solid var(--border);
+  .navlinks a {
+    padding: 8px 14px;
+    border-radius: 999px;
+    font-size: 13px;
+    color: var(--muted);
+  }
+  .navlinks a.active, .navlinks a:hover {
+    color: #fff;
+    background: rgba(139, 92, 246, 0.2);
+    border: 1px solid var(--line2);
+  }
+  .status-pill {
     display: flex;
     align-items: center;
-    justify-content: space-between;
-    background: var(--surface2);
-    font-size: 0.85rem;
-    font-weight: 600;
+    gap: 8px;
+    font-size: 12px;
     color: var(--muted);
   }
+  .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--green);
+    box-shadow: 0 0 10px var(--green);
+  }
+  .layout {
+    display: grid;
+    grid-template-columns: 240px 1fr 320px;
+    gap: 16px;
+    padding: 18px;
+    max-width: 1500px;
+    margin: 0 auto;
+  }
+  @media (max-width: 1100px) {
+    .layout { grid-template-columns: 1fr; }
+    .side, .right { order: 0; }
+  }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    box-shadow: 0 10px 40px rgba(0,0,0,0.35);
+  }
+  .side {
+    padding: 14px;
+    height: fit-content;
+  }
+  .side h3 {
+    font-size: 12px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    margin: 8px 8px 12px;
+  }
+  .menu button {
+    width: 100%;
+    text-align: left;
+    border: 1px solid transparent;
+    background: transparent;
+    color: var(--text);
+    padding: 12px 14px;
+    border-radius: 12px;
+    cursor: pointer;
+    font: inherit;
+    font-size: 13.5px;
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    margin-bottom: 6px;
+  }
+  .menu button.active, .menu button:hover {
+    background: linear-gradient(90deg, rgba(124,58,237,0.35), rgba(124,58,237,0.08));
+    border-color: var(--line2);
+  }
+  .menu button span.icon {
+    width: 22px; text-align: center; opacity: 0.9;
+  }
+  .main { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+  .hero {
+    padding: 22px 24px;
+    background:
+      linear-gradient(120deg, rgba(124,58,237,0.25), transparent 55%),
+      var(--panel);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    display: flex;
+    justify-content: space-between;
+    gap: 16px;
+    align-items: center;
+  }
+  .hero h1 {
+    font-size: 1.6rem;
+    font-weight: 800;
+    letter-spacing: -0.02em;
+    background: linear-gradient(90deg, #fff, #c4b5fd);
+    -webkit-background-clip: text;
+    color: transparent;
+  }
+  .hero p { color: var(--muted); margin-top: 6px; font-size: 13.5px; }
+  .badges { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+  .badge {
+    font-size: 11px;
+    padding: 5px 10px;
+    border-radius: 999px;
+    border: 1px solid var(--line);
+    color: var(--purple2);
+    background: rgba(139,92,246,0.12);
+  }
+  .editor-wrap { overflow: hidden; display: flex; flex-direction: column; min-height: 480px; }
+  .editor-h {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 10px;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--line);
+    background: var(--panel2);
+    flex-wrap: wrap;
+  }
+  .editor-h .title {
+    font-weight: 700;
+    font-size: 13px;
+    color: var(--purple2);
+  }
+  .tools { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  select, button, .file-btn {
+    font: inherit;
+    font-size: 12.5px;
+    border-radius: 10px;
+    border: 1px solid var(--line);
+    background: rgba(20, 14, 36, 0.9);
+    color: var(--text);
+    padding: 8px 12px;
+    cursor: pointer;
+  }
+  select:hover, button:hover, .file-btn:hover { border-color: var(--line2); }
+  button.primary {
+    background: linear-gradient(135deg, #7c3aed, #a855f7);
+    border: none;
+    font-weight: 700;
+    box-shadow: var(--glow);
+  }
+  button.primary:disabled { opacity: 0.55; cursor: not-allowed; box-shadow: none; }
+  button.ghost { background: transparent; }
+  .file-btn { display: inline-flex; align-items: center; gap: 6px; }
+  #fileInput { display: none; }
+  .grid2 {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    min-height: 420px;
+  }
+  @media (max-width: 820px) { .grid2 { grid-template-columns: 1fr; } }
+  .col {
+    display: flex;
+    flex-direction: column;
+    border-right: 1px solid var(--line);
+    min-height: 380px;
+  }
+  .col:last-child { border-right: none; }
+  .col-h {
+    padding: 10px 14px;
+    font-size: 12px;
+    color: var(--muted);
+    border-bottom: 1px solid var(--line);
+    display: flex;
+    justify-content: space-between;
+  }
   textarea, pre {
+    flex: 1;
     width: 100%;
     min-height: 340px;
-    padding: 16px;
+    padding: 14px 16px;
     background: transparent;
     border: none;
     color: var(--text);
-    font-family: "SF Mono", "Fira Code", "Cascadia Code", Consolas, monospace;
-    font-size: 13.5px;
+    font-family: "JetBrains Mono", "Fira Code", "SF Mono", Consolas, monospace;
+    font-size: 13px;
     line-height: 1.55;
     resize: vertical;
     outline: none;
@@ -2207,118 +2411,154 @@ function serve(port) {
     word-break: break-all;
     overflow: auto;
     margin: 0;
+    color: #ddd6fe;
   }
-  .toolbar {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    margin: 18px 0;
-    flex-wrap: wrap;
-  }
-  select, button, .file-btn {
-    font: inherit;
-    border-radius: 8px;
-    border: 1px solid var(--border);
-    background: var(--surface2);
-    color: var(--text);
-    padding: 9px 14px;
-    cursor: pointer;
-    transition: 0.15s ease;
-  }
-  select:hover, button:hover, .file-btn:hover {
-    border-color: var(--accent);
-  }
-  button.primary {
-    background: linear-gradient(135deg, var(--accent), #5b7cfa);
-    border: none;
-    color: #fff;
-    font-weight: 600;
-    padding: 10px 22px;
-  }
-  button.primary:hover {
-    filter: brightness(1.08);
-  }
-  button.primary:disabled {
-    opacity: 0.55;
-    cursor: not-allowed;
-    filter: none;
-  }
-  button.ghost, .file-btn {
-    background: transparent;
-  }
-  .file-btn {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-  }
-  .status {
-    font-size: 0.82rem;
-    color: var(--muted);
-    margin-left: auto;
-  }
-  .status.ok { color: var(--success); }
-  .status.err { color: var(--danger); }
-  footer {
-    margin-top: 28px;
+  .right { padding: 16px; height: fit-content; }
+  .result-card {
     text-align: center;
-    font-size: 0.8rem;
-    color: var(--muted);
+    padding: 22px 12px 16px;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    background: rgba(124,58,237,0.08);
+    margin-bottom: 14px;
   }
-  #fileInput { display: none; }
+  .result-card .check {
+    width: 52px; height: 52px; margin: 0 auto 12px;
+    border-radius: 50%;
+    display: grid; place-items: center;
+    background: rgba(52, 211, 153, 0.15);
+    border: 1px solid rgba(52,211,153,0.4);
+    color: var(--green);
+    font-size: 22px;
+  }
+  .result-card h3 { font-size: 15px; margin-bottom: 6px; }
+  .result-card p { color: var(--muted); font-size: 12.5px; }
+  .stats {
+    display: grid;
+    gap: 8px;
+    margin-top: 8px;
+  }
+  .stat {
+    display: flex;
+    justify-content: space-between;
+    padding: 10px 12px;
+    border-radius: 10px;
+    background: rgba(0,0,0,0.25);
+    border: 1px solid var(--line);
+    font-size: 12.5px;
+  }
+  .stat b { color: var(--purple2); font-weight: 600; }
+  .status-line {
+    margin-top: 12px;
+    font-size: 12px;
+    color: var(--muted);
+    min-height: 18px;
+  }
+  .status-line.ok { color: var(--green); }
+  .status-line.err { color: var(--danger); }
+  .foot {
+    text-align: center;
+    color: var(--muted);
+    font-size: 11.5px;
+    padding: 8px 18px 22px;
+  }
 </style>
 </head>
 <body>
-  <div class="wrap">
-    <header>
-      <div class="brand">
-        <div class="logo">E</div>
-        <div>
-          <h1>Euana</h1>
-        </div>
-        <span class="ver">v${VERSION}</span>
+  <header class="topnav">
+    <div class="brand">
+      <div class="logo">E</div>
+      <div>
+        EUANA
+        <small>ULTIMATE VM</small>
       </div>
-    </header>
-
-    <div class="toolbar">
-      <label style="font-size:0.85rem;color:var(--muted)">Intensity</label>
-      <select id="iv">
-        <option value="v1">v1 — Light</option>
-        <option value="v2">v2 — Medium</option>
-        <option value="v3" selected>v3 — Heavy</option>
-      </select>
-      <button class="primary" id="go">Obfuscate</button>
-      <label class="file-btn" for="fileInput">Upload File</label>
-      <input type="file" id="fileInput" accept=".lua,.txt,.luau,.luac,text/plain">
-      <button class="ghost" id="download">Download</button>
-      <button class="ghost" id="copy">Copy Output</button>
-      <button class="ghost" id="clear">Clear</button>
-      <span class="status" id="status">Ready</span>
     </div>
+    <nav class="navlinks">
+      <a class="active" href="#">홈</a>
+      <a href="#">난독화</a>
+      <a href="#">분석</a>
+      <a href="#">도구</a>
+    </nav>
+    <div class="status-pill"><span class="dot"></span> 서버 정상 · v${VERSION}</div>
+  </header>
 
-    <div class="grid">
-      <div class="card">
-        <div class="card-h">
-          <span>Input (Lua / Luau)</span>
-          <span id="inLen" style="font-weight:400">0 chars</span>
+  <div class="layout">
+    <aside class="panel side">
+      <h3>기능 메뉴</h3>
+      <div class="menu">
+        <button class="active" type="button"><span class="icon">🔒</span> 난독화</button>
+        <button type="button" disabled style="opacity:.45"><span class="icon">▶</span> 컴파일러</button>
+        <button type="button" disabled style="opacity:.45"><span class="icon">↺</span> 디컴파일러</button>
+        <button type="button" disabled style="opacity:.45"><span class="icon">📊</span> 코드 분석기</button>
+        <button type="button" disabled style="opacity:.45"><span class="icon">🛡</span> VM 보호</button>
+      </div>
+    </aside>
+
+    <section class="main">
+      <div class="hero">
+        <div>
+          <h1>EUANA ULTIMATE</h1>
+          <p>커스텀 바이트코드 VM · 상수/스트림 암호화 · 원본 소스 평문 제거</p>
+          <div class="badges">
+            <span class="badge">Bytecode VM</span>
+            <span class="badge">100 VM profiles</span>
+            <span class="badge">no-plain-source</span>
+            <span class="badge">v${VERSION}</span>
+          </div>
         </div>
-        <textarea id="src" spellcheck="false" placeholder="-- paste your Lua / Luau code here
-print('hello from Euana')">print("Hello from Euana")
+      </div>
+
+      <div class="panel editor-wrap">
+        <div class="editor-h">
+          <div class="title">&lt;/&gt; 코드 에디터</div>
+          <div class="tools">
+            <label style="font-size:12px;color:var(--muted)">Intensity</label>
+            <select id="iv">
+              <option value="v1">v1 — Light</option>
+              <option value="v2">v2 — Medium</option>
+              <option value="v3" selected>v3 — Heavy</option>
+            </select>
+            <button class="primary" id="go">난독화 실행</button>
+            <label class="file-btn" for="fileInput">업로드</label>
+            <input type="file" id="fileInput" accept=".lua,.txt,.luau,text/plain">
+            <button class="ghost" id="download">다운로드</button>
+            <button class="ghost" id="copy">복사</button>
+            <button class="ghost" id="clear">초기화</button>
+          </div>
+        </div>
+        <div class="grid2">
+          <div class="col">
+            <div class="col-h"><span>Input (Lua / Luau)</span><span id="inLen">0 chars</span></div>
+            <textarea id="src" spellcheck="false">print("Hello from Euana")
 local function add(a, b)
   return a + b
 end
 print(add(20, 22))</textarea>
-      </div>
-      <div class="card">
-        <div class="card-h">
-          <span>Output</span>
-          <span id="outLen" style="font-weight:400">0 chars</span>
+          </div>
+          <div class="col">
+            <div class="col-h"><span>Output</span><span id="outLen">0 chars</span></div>
+            <pre id="out">// 난독화 결과가 여기에 표시됩니다</pre>
+          </div>
         </div>
-        <pre id="out">// obfuscated code will appear here</pre>
       </div>
-    </div>
+    </section>
 
-    <footer>Protected by Euana · Bytecode / CF-VM Obfuscator</footer>
+    <aside class="panel right">
+      <div class="result-card">
+        <div class="check" id="checkIcon">✓</div>
+        <h3 id="resultTitle">대기 중</h3>
+        <p id="resultDesc">코드를 입력한 뒤 난독화를 실행하세요.</p>
+      </div>
+      <div class="stats">
+        <div class="stat"><span>입력 크기</span><b id="stIn">0 B</b></div>
+        <div class="stat"><span>출력 크기</span><b id="stOut">0 B</b></div>
+        <div class="stat"><span>처리 시간</span><b id="stMs">—</b></div>
+        <div class="stat"><span>모드</span><b id="stMode">bytecode</b></div>
+      </div>
+      <div class="status-line" id="status">Ready</div>
+    </aside>
   </div>
+  <div class="foot">Protected by Euana · Custom Bytecode / CF-VM Obfuscator</div>
 
 <script>
 const src = document.getElementById("src");
@@ -2333,19 +2573,23 @@ const fileInput = document.getElementById("fileInput");
 function updateLens() {
   inLen.textContent = src.value.length.toLocaleString() + " chars";
   outLen.textContent = (out.textContent || "").length.toLocaleString() + " chars";
+  document.getElementById("stIn").textContent = src.value.length.toLocaleString() + " B";
+  document.getElementById("stOut").textContent = (out.textContent || "").length.toLocaleString() + " B";
 }
 src.addEventListener("input", updateLens);
 updateLens();
 
 go.onclick = async () => {
   if (!src.value.trim()) {
-    status.textContent = "Input is empty";
-    status.className = "status err";
+    status.textContent = "입력이 비어 있습니다";
+    status.className = "status-line err";
     return;
   }
   go.disabled = true;
-  status.textContent = "Obfuscating…";
-  status.className = "status";
+  status.textContent = "난독화 중…";
+  status.className = "status-line";
+  document.getElementById("resultTitle").textContent = "처리 중";
+  document.getElementById("resultDesc").textContent = "VM 프로파일 선택 및 암호화 진행 중";
   const t0 = performance.now();
   try {
     const r = await fetch("/api/obfuscate", {
@@ -2357,12 +2601,21 @@ go.onclick = async () => {
     if (!r.ok) throw new Error(j.error || "Request failed");
     out.textContent = j.code || "";
     const ms = Math.round(performance.now() - t0);
-    status.textContent = "Done in " + ms + "ms · " + (j.version || "");
-    status.className = "status ok";
+    document.getElementById("stMs").textContent = ms + " ms";
+    const mode = ((j.code || "").match(/\\|\\s*(\\w+)\\s*\\|\\s*no-plain-source/) || [])[1] || "bytecode";
+    document.getElementById("stMode").textContent = mode;
+    status.textContent = "완료 · " + ms + "ms · v" + (j.version || "");
+    status.className = "status-line ok";
+    document.getElementById("resultTitle").textContent = "난독화 완료";
+    document.getElementById("resultDesc").textContent = "원본 소스 평문 없이 보호된 코드를 생성했습니다.";
+    document.getElementById("checkIcon").textContent = "✓";
     updateLens();
   } catch (e) {
     status.textContent = String(e.message || e);
-    status.className = "status err";
+    status.className = "status-line err";
+    document.getElementById("resultTitle").textContent = "실패";
+    document.getElementById("resultDesc").textContent = String(e.message || e);
+    document.getElementById("checkIcon").textContent = "!";
   } finally {
     go.disabled = false;
   }
@@ -2373,69 +2626,54 @@ document.getElementById("copy").onclick = async () => {
   if (!t || t.startsWith("//")) return;
   try {
     await navigator.clipboard.writeText(t);
-    status.textContent = "Copied to clipboard";
-    status.className = "status ok";
+    status.textContent = "클립보드에 복사됨";
+    status.className = "status-line ok";
   } catch {
-    status.textContent = "Copy failed";
-    status.className = "status err";
+    status.textContent = "복사 실패";
+    status.className = "status-line err";
   }
 };
 
 document.getElementById("clear").onclick = () => {
   src.value = "";
-  out.textContent = "// obfuscated code will appear here";
-  status.textContent = "Cleared";
-  status.className = "status";
+  out.textContent = "// 난독화 결과가 여기에 표시됩니다";
+  status.textContent = "초기화됨";
+  status.className = "status-line";
   fileInput.value = "";
   updateLens();
 };
 
-// Upload file → load into input (robust)
 fileInput.addEventListener("change", async () => {
   const file = fileInput.files && fileInput.files[0];
   if (!file) return;
-
-  // size guard (10MB)
   if (file.size > 10 * 1024 * 1024) {
-    status.textContent = "File too large (max 10MB)";
-    status.className = "status err";
-    fileInput.value = "";
+    status.textContent = "파일이 너무 큽니다 (max 10MB)";
+    status.className = "status-line err";
     return;
   }
-
-  status.textContent = "Reading " + file.name + "…";
-  status.className = "status";
-
+  status.textContent = "읽는 중…";
   try {
-    let text = "";
-    // Prefer modern API first
-    if (file.text) {
-      text = await file.text();
-    } else {
-      text = await new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => resolve(String(reader.result || ""));
-        reader.onerror = () => reject(reader.error || new Error("read error"));
-        reader.readAsText(file);
-      });
-    }
+    const text = file.text ? await file.text() : await new Promise((res, rej) => {
+      const r = new FileReader();
+      r.onload = () => res(String(r.result || ""));
+      r.onerror = () => rej(r.error);
+      r.readAsText(file);
+    });
     src.value = text;
-    status.textContent = "Loaded: " + file.name + " (" + text.length.toLocaleString() + " chars)";
-    status.className = "status ok";
+    status.textContent = "로드됨: " + file.name;
+    status.className = "status-line ok";
     updateLens();
   } catch (e) {
-    console.error(e);
-    status.textContent = "Load failed — try a smaller file or desktop browser";
-    status.className = "status err";
+    status.textContent = "로드 실패";
+    status.className = "status-line err";
   }
 });
 
-// Download output as .lua file
 document.getElementById("download").onclick = () => {
   const t = out.textContent || "";
   if (!t || t.startsWith("//")) {
-    status.textContent = "No output to download";
-    status.className = "status err";
+    status.textContent = "다운로드할 출력이 없습니다";
+    status.className = "status-line err";
     return;
   }
   const blob = new Blob([t], { type: "text/plain;charset=utf-8" });
@@ -2447,8 +2685,8 @@ document.getElementById("download").onclick = () => {
   a.click();
   a.remove();
   URL.revokeObjectURL(url);
-  status.textContent = "Download started";
-  status.className = "status ok";
+  status.textContent = "다운로드 시작";
+  status.className = "status-line ok";
 };
 </script>
 </body>
