@@ -1136,15 +1136,21 @@ function emitBcVm(blob, alph, pad, keyMat, op) {
   const cAdd = opaqueConst(1013904223);
   const cXor = opaqueConst(0xa5a5a5a5);
 
-  // Safe long-string level: avoid ]===] and [===[ inside blob
-  let eq = "=";
-  for (let guard = 0; guard < 16; guard++) {
-    const closer = "]" + eq + "]";
-    const opener = "[" + eq + "[";
-    if (!blob.includes(closer) && !blob.includes(opener)) break;
-    eq += "=";
+  // Embed blob as concatenated short quoted strings (Roblox-safe)
+  function embedBlob(s) {
+    const parts = [];
+    const chunk = 180;
+    for (let i = 0; i < s.length; i += chunk) {
+      const piece = s.slice(i, i + chunk)
+        .replace(/\\/g, "\\\\")
+        .replace(/"/g, '\\"')
+        .replace(/\r/g, "\\r")
+        .replace(/\n/g, "\\n");
+      parts.push('"' + piece + '"');
+    }
+    return parts.length ? parts.join("..") : '""';
   }
-  const payload = `[${eq}[${blob}]${eq}]`;
+  const payload = embedBlob(blob);
   const alphEsc = alph.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
   // map real op names to random idents (no OP_LOADK leaks)
   const opId = {};
@@ -1157,23 +1163,20 @@ function emitBcVm(blob, alph, pad, keyMat, op) {
   const intensity = keyMat.intensity || "v3";
   const heavy = intensity === "v4" || intensity === "v5";
 
-  // Polymorphic anti (env integrity + getinfo/debug checks)
+  // Polymorphic anti — Roblox/Luau safe (no getfenv, no bare debug, no hang loops)
   const antiParts = [
-    `if type(string)~="table" or type(string.char)~="function" then while true do end end`,
-    `if type(table)~="table" or type(table.concat)~="function" then while true do end end`,
-    `if type(math)~="table" or type(math.floor)~="function" then while true do end end`,
-    `if select("#",1,2)~=2 then while true do end end`,
-    `if (1==1)==false then while true do end end`,
-    `if type(type)~="function" then while true do end end`,
-    `if type(pcall)~="function" or type(error)~="function" then while true do end end`,
-    `if type(rawget)~="function" or type(rawset)~="function" then while true do end end`,
-    `if type(tostring)~="function" or type(tonumber)~="function" then while true do end end`,
-    `do local _t=type; if _t(_t)~="function" then while true do end end end`,
-    // anti-debug / getinfo (safe even if debug is nil)
-    `do local ok,d=pcall(function() return debug end); if ok and type(d)=="table" and type(d.getinfo)=="function" then local i=d.getinfo(1,"S"); if i and (i.what=="C" or (type(i.source)=="string" and #i.source>0 and i.source:sub(1,1)~="@" and i.source:sub(1,1)~="=")) then end end end`,
-    `do local ok,d=pcall(function() return debug end); if ok and d and type(d.sethook)=="function" then pcall(d.sethook) end end`,
-    `if type(getfenv)=="function" then local e=getfenv(0); if type(e)~="table" then while true do end end end`,
-    `do local a,b=1,2; if a+b~=3 or a*b~=2 then while true do end end end`,
+    `if type(string)~="table" or type(string.char)~="function" then return end`,
+    `if type(table)~="table" or type(table.concat)~="function" then return end`,
+    `if type(math)~="table" or type(math.floor)~="function" then return end`,
+    `if select("#",1,2)~=2 then return end`,
+    `if (1==1)==false then return end`,
+    `if type(type)~="function" then return end`,
+    `if type(pcall)~="function" or type(error)~="function" then return end`,
+    `if type(rawget)~="function" or type(rawset)~="function" then return end`,
+    `if type(tostring)~="function" or type(tonumber)~="function" then return end`,
+    `do local _t=type; if _t(_t)~="function" then return end end`,
+    `do local a,b=1,2; if a+b~=3 or a*b~=2 then return end end`,
+    `do local ok=pcall(function() local _=string.byte("A",1) end); if not ok then return end end`,
   ];
   for (let i = antiParts.length - 1; i > 0; i--) {
     const j = randInt(0, i);
@@ -1185,6 +1188,8 @@ function emitBcVm(blob, alph, pad, keyMat, op) {
   let body = `
 return (function(...)
 ${anti}
+local pack=table.pack or function(...) return {n=select("#",...),...} end
+local unpack=table.unpack or unpack
 local function ${N.bx}(a,b)
 a=math.floor(a)%256 b=math.floor(b)%256
 local r,p=0,1
@@ -1294,7 +1299,7 @@ for _i=1,math.min(8,nconst) do
 local _c=${N.kn}[_i]
 if _c and _c.e then _z=_z+#_c.e end
 end
-if _z<0 then while true do end end
+if _z<0 then return end
 end
 local ${N.code}_opx=((${keyName}[1]*256)~${keyName}[2]~(${keyName}[3]*16)~0xA5A5)%65536
 local function ${N.code}_at(i)
@@ -1391,7 +1396,7 @@ local args={}
 for i=nargs,1,-1 do args[i]=pop() end
 local fn=pop()
 if type(fn)=="function" then
-local rets=table.pack(fn(table.unpack(args,1,nargs)))
+local rets=pack(fn(unpack(args,1,nargs)))
 if nrets==1 then push(rets[1])
 elseif nrets>1 then for i=1,nrets do push(rets[i]) end
 elseif nrets==0 then
@@ -1430,7 +1435,7 @@ local entry=${N.code}_at(${N.pc}) ${N.pc}=${N.pc}+1
 local nparams=${N.code}_at(${N.pc}) ${N.pc}=${N.pc}+1
 local env_ref=${N.env}
 push(function(...)
-local args=table.pack(...)
+local args=pack(...)
 local st={} local sp=0 local pc=entry
 local locals={}
 for i=1,math.min(nparams,args.n) do locals[i-1]=args[i] end
@@ -1486,7 +1491,7 @@ local na=${N.code}_at(pc) pc=pc+1 local nr=${N.code}_at(pc) pc=pc+1
 local a2={} for i=na,1,-1 do a2[i]=pop2() end
 local fn=pop2()
 if type(fn)=="function" then
-local rets=table.pack(fn(table.unpack(a2,1,na)))
+local rets=pack(fn(unpack(a2,1,na)))
 if nr==1 then push2(rets[1])
 elseif nr>1 then for i=1,nr do push2(rets[i]) end
 else for i=1,rets.n do push2(rets[i]) end end
@@ -1513,7 +1518,7 @@ local op2=${N.code}_at(pc) pc=pc+1
 local h2=H2[op2]
 if not h2 then break end
 h2()
-if ret2 then return table.unpack(ret2,1,ret2.n) end
+if ret2 then return unpack(ret2,1,ret2.n) end
 end
 end)
 end
@@ -1523,7 +1528,7 @@ local h=${N.vm}_H[op]
 if not h then break end
 h()
 if ${N.vm}_ret then
-return table.unpack(${N.vm}_ret,1,${N.vm}_ret.n)
+return unpack(${N.vm}_ret,1,${N.vm}_ret.n)
 end
 end
 end
@@ -1679,7 +1684,7 @@ function emitBytecodeObfuscation(src, intensity) {
  */
 
 const APP_NAME = "Euana";
-const VERSION = "5.2.1"; // fix long-string alphabet, remove Luraph, Euana-only
+const VERSION = "5.3.0"; // Roblox/Luau safe embed, polyfills, Luraph-inspired hardening
 
 function randInt(a, b) {
   return a + Math.floor(Math.random() * (b - a + 1));
