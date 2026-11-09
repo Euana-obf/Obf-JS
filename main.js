@@ -1567,7 +1567,7 @@ function emitBytecodeObfuscation(src, intensity) {
  */
 
 const APP_NAME = "Euana";
-const VERSION = "4.1.0";
+const VERSION = "4.2.0";
 
 function randInt(a, b) {
   return a + Math.floor(Math.random() * (b - a + 1));
@@ -2090,7 +2090,83 @@ function runTests() {
   console.log(pass + " pass / " + fail + " fail");
   process.exit(fail ? 1 : 0);
 }
+
+/**
+ * Luraph API client (https://api.lura.ph/v1)
+ * Auth: Luraph-API-Key header — get key from https://lura.ph/dashboard/account
+ * Env: LURAPH_API_KEY or LPH_API_KEY
+ */
+// Default Luraph key (prefer env LURAPH_API_KEY / LPH_API_KEY over this)
+const LURAPH_DEFAULT_KEY = "c0691d369dae361e1abb072d584a3c7084e7b8b9d522b33d308be7b84dded65c";
+
+async function luraphRequest(path, { method = "GET", body, apiKey, raw = false } = {}) {
+  const key = apiKey || process.env.LURAPH_API_KEY || process.env.LPH_API_KEY || LURAPH_DEFAULT_KEY;
+  if (!key) throw new Error("Luraph API key missing (set LURAPH_API_KEY)");
+  const url = new URL(path.replace(/^\//, ""), "https://api.lura.ph/v1/");
+  const res = await fetch(url, {
+    method,
+    headers: {
+      "Luraph-API-Key": key,
+      "Content-Type": "application/json",
+      Accept: "application/json",
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (raw) return res;
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const msg =
+      (data && (data.message || data.error)) ||
+      (Array.isArray(data.errors) && data.errors.map((e) => e.message || e).join("; ")) ||
+      `Luraph HTTP ${res.status}`;
+    throw new Error(String(msg));
+  }
+  return data;
+}
+
+async function luraphGetNodes(apiKey) {
+  return luraphRequest("obfuscate/nodes", { apiKey });
+}
+
+async function luraphObfuscate(script, options = {}) {
+  const apiKey = options.apiKey || process.env.LURAPH_API_KEY || process.env.LPH_API_KEY || LURAPH_DEFAULT_KEY;
+  if (!apiKey) throw new Error("Luraph API key missing (set LURAPH_API_KEY)");
+  const fileName = options.fileName || `euana-${Date.now()}.lua`;
+  const luraphOptions = options.options || {};
+  const useTokens = !!options.useTokens;
+  const enforceSettings = options.enforceSettings === true; // default false for fewer breaks
+
+  const nodes = await luraphGetNodes(apiKey);
+  const nodeId = options.node || nodes.recommendedId;
+  if (!nodeId) throw new Error("No Luraph node available");
+
+  const b64 = Buffer.from(String(script), "utf8").toString("base64");
+  const { jobId } = await luraphRequest("obfuscate/new", {
+    method: "POST",
+    apiKey,
+    body: {
+      node: nodeId,
+      script: b64,
+      fileName,
+      options: luraphOptions,
+      useTokens,
+      enforceSettings,
+    },
+  });
+  if (!jobId) throw new Error("Luraph did not return jobId");
+
+  // status endpoint blocks until done (server timeout ~60–180s)
+  const status = await luraphRequest(`obfuscate/status/${jobId}`, { apiKey });
+  if (status.error) throw new Error(String(status.error));
+
+  const dl = await luraphRequest(`obfuscate/download/${jobId}`, { apiKey, raw: true });
+  if (!dl.ok) throw new Error(`Luraph download failed (${dl.status})`);
+  const data = await dl.text();
+  return { code: data, jobId, nodeId, engine: "luraph" };
+}
+
 function serve(port) {
+
   port = Number(port) || Number(process.env.PORT) || 3000;
   const html = `<!DOCTYPE html>
 <html lang="ko">
@@ -2280,6 +2356,11 @@ function serve(port) {
     </header>
 
     <div class="toolbar">
+      <label style="font-size:0.85rem;color:var(--muted)">Engine</label>
+      <select id="engine">
+        <option value="euana" selected>Euana (local)</option>
+        <option value="luraph">Luraph API</option>
+      </select>
       <label style="font-size:0.85rem;color:var(--muted)">Intensity</label>
       <select id="iv">
         <option value="v1">v1 — Light</option>
@@ -2348,10 +2429,12 @@ go.onclick = async () => {
   status.className = "status";
   const t0 = performance.now();
   try {
+    const engineEl = document.getElementById("engine");
+    const engine = engineEl ? engineEl.value : "euana";
     const r = await fetch("/api/obfuscate", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ code: src.value, intensity: iv.value })
+      body: JSON.stringify({ code: src.value, intensity: iv.value, engine })
     });
     const j = await r.json();
     if (!r.ok) throw new Error(j.error || "Request failed");
@@ -2459,19 +2542,38 @@ document.getElementById("download").onclick = () => {
       res.end(html);
       return;
     }
+    if (req.method === "GET" && req.url === "/api/engines") {
+      const hasLuraph = !!(process.env.LURAPH_API_KEY || process.env.LPH_API_KEY || LURAPH_DEFAULT_KEY);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ engines: ["euana", "luraph"], luraphConfigured: hasLuraph, version: VERSION }));
+      return;
+    }
     if (req.method === "POST" && req.url === "/api/obfuscate") {
       let body = "";
       req.on("data", (c) => (body += c));
-      req.on("end", () => {
+      req.on("end", async () => {
         try {
           const j = JSON.parse(body || "{}");
+          const engine = (j.engine || "euana").toLowerCase();
+          let code;
+          let meta = { version: VERSION, engine };
+          if (engine === "luraph") {
+            const result = await luraphObfuscate(j.code || "", {
+              apiKey: j.apiKey,
+              options: j.luraphOptions || {},
+              fileName: j.fileName,
+              useTokens: j.useTokens,
+              enforceSettings: j.enforceSettings,
+              node: j.node,
+            });
+            code = result.code;
+            meta.jobId = result.jobId;
+            meta.nodeId = result.nodeId;
+          } else {
+            code = obfuscateCode(j.code || "", j.intensity || "v3");
+          }
           res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(
-            JSON.stringify({
-              code: obfuscateCode(j.code || "", j.intensity || "v3"),
-              version: VERSION,
-            })
-          );
+          res.end(JSON.stringify({ code, ...meta }));
         } catch (e) {
           res.writeHead(500);
           res.end(JSON.stringify({ error: String(e.message || e) }));
@@ -2501,4 +2603,4 @@ function mainCli() {
   console.log("ok", output, out.length, "bytes", Date.now()-t0, "ms");
 }
 if (require.main===module) mainCli();
-module.exports = { obfuscateCode, VERSION, preprocessLuau, compileToBytecode, emitBytecodeObfuscation };
+module.exports = { obfuscateCode, luraphObfuscate, luraphGetNodes, VERSION, preprocessLuau, compileToBytecode, emitBytecodeObfuscation };
