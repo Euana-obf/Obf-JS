@@ -223,15 +223,15 @@ class Compiler {
       "NEWTABLE", "GETTABLE", "SETTABLE",
       "GETLOCAL", "SETLOCAL", "HALT", "SELF", "CLOSURE", "SWAP",
     ];
-    const base = names.map((_, i) => i + 1);
-    for (let i = base.length - 1; i > 0; i--) {
-      const j = randInt(0, i);
-      [base[i], base[j]] = [base[j], base[i]];
-    }
+    // Sparse virtualized opcodes (16-bit space) — hard to pattern-match
+    const used = new Set();
     this.OP = {};
-    names.forEach((n, i) => {
-      this.OP[n] = base[i];
-    });
+    for (const n of names) {
+      let v;
+      do { v = randInt(0x101, 0x7eff); } while (used.has(v));
+      used.add(v);
+      this.OP[n] = v;
+    }
     this.localsStack = [{}];
     this.localCount = [0];
   }
@@ -388,7 +388,7 @@ class Compiler {
       this.popScope();
       this.eat("end");
       this.code[jmpAt + 1] = this.code.length - (jmpAt + 2);
-      if (!this.OP.CLOSURE) this.OP.CLOSURE = 50 + randInt(1, 20);
+      if (!this.OP.CLOSURE) { let v; do { v = randInt(0x101, 0x7eff); } while (Object.values(this.OP).includes(v)); this.OP.CLOSURE = v; }
       this.emit(this.OP.CLOSURE, bodyStart + 1, params.length);
       // assign
       if (path.length === 1 && !method) {
@@ -495,9 +495,7 @@ class Compiler {
     const bodyEnd = this.code.length;
     this.code[jmpAt + 1] = bodyEnd - (jmpAt + 2);
     // Closure: we need OP_CLOSURE - add dynamically
-    if (!this.OP.CLOSURE) {
-      this.OP.CLOSURE = 50 + randInt(1, 20);
-    }
+    if (!this.OP.CLOSURE) { let v; do { v = randInt(0x101, 0x7eff); } while (Object.values(this.OP).includes(v)); this.OP.CLOSURE = v; }
     this.emit(this.OP.CLOSURE, bodyStart + 1, params.length);
     if (isLocal) this.emit(this.OP.SETLOCAL, target);
     else this.emit(this.OP.SETGLOBAL, typeof target === "number" ? target : this.intern(String(target)));
@@ -862,7 +860,7 @@ class Compiler {
       this.popScope();
       this.eat("end");
       this.code[jmpAt + 1] = this.code.length - (jmpAt + 2);
-      if (!this.OP.CLOSURE) this.OP.CLOSURE = 50 + randInt(1, 20);
+      if (!this.OP.CLOSURE) { let v; do { v = randInt(0x101, 0x7eff); } while (Object.values(this.OP).includes(v)); this.OP.CLOSURE = v; }
       this.emit(this.OP.CLOSURE, bodyStart + 1, params.length);
       return;
     }
@@ -1000,13 +998,15 @@ function encodeBc(data, key) {
   const out = Buffer.alloc(data.length);
   let state = (key[0] + key[1] * 256 + key[2] * 65536 + key[3] * 16777216) >>> 0;
   if (!state) state = 1;
+  // Multi-round keystream inspired by denser commercial VMs (Luraph-style resistance)
   for (let i = 0; i < data.length; i++) {
     state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
-    out[i] =
-      data[i] ^
-      key[i % key.length] ^
-      ((state >>> 16) & 0xff) ^
-      ((i * 131) & 0xff);
+    const k1 = key[i % key.length];
+    const k2 = key[(i * 7 + 3) % key.length];
+    const mix = ((state >>> 16) & 0xff) ^ ((i * 131) & 0xff) ^ ((state >>> 8) & 0xff);
+    out[i] = data[i] ^ k1 ^ k2 ^ mix;
+    // feedback for next state
+    state = (state ^ (out[i] << ((i % 4) * 8))) >>> 0;
   }
   return out;
 }
@@ -1044,11 +1044,19 @@ function packProgram(code, constants, key) {
       parts.push(Buffer.from([3, s.length & 0xff, (s.length >> 8) & 0xff]), s);
     }
   }
-  // Encrypt each code word with fixed keystream
+  // Opcode virtualization: position XOR then multi-round keystream (mirrored in Lua _at)
+  const opXor = ((key[0] << 8) ^ key[1] ^ (key[2] << 4) ^ 0xA5A5) & 0xffff;
   for (let ci = 0; ci < code.length; ci++) {
     let v = code[ci] & 0xffff;
-    let st = (key[ci % 16] ^ ((ci * 0x9e3779b9) >>> 0)) >>> 0;
+    // layer-1: virtualize opcode/immediate values
+    v = (v ^ ((opXor + Math.imul(ci, 0x45d9)) & 0xffff)) & 0xffff;
+    const kb = key[ci % key.length];
+    const kb2 = key[(ci * 3) % key.length];
+    let mix = (Math.imul(ci, 0x9e3779b9) >>> 0);
+    let st = (kb ^ (mix & 0xff) ^ kb2) >>> 0;
+    st = (st + (mix - (mix & 0xff))) >>> 0;
     st = (Math.imul(st, 1664525) + 1013904223) >>> 0;
+    st = (Math.imul(st ^ Math.imul(ci, 0x85ebca6b), 1664525) + 1013904223) >>> 0;
     const mask = (st >>> 16) & 0xffff;
     v = (v ^ mask) & 0xffff;
     parts.push(Buffer.from([v & 0xff, (v >> 8) & 0xff]));
@@ -1085,19 +1093,20 @@ function emitBcVm(blob, alph, pad, keyMat, op) {
   for (const k of ["bx", "dec", "st", "sp", "pc", "kn", "code", "locals", "vm", "env"]) {
     N[k] = randIdent();
   }
-  const { seedStr, saltA, saltB } = keyMat;
+  const { seedStr, saltA, saltB, saltC } = keyMat;
   const mixMul = (keyMat.mixMul >>> 0) || 0x9e3779b9;
   const mixA = (keyMat.mixA >>> 0) || 1664525;
   const mixB = (keyMat.mixB >>> 0) || 1013904223;
-  const shell = (keyMat.shell | 0) % 10;
+  const shell = (keyMat.shell | 0) % 12;
   const variant = keyMat.variant | 0;
   const keyName = randIdent(12);
   const seedName = randIdent(10);
   const saltNameA = randIdent(8);
   const saltNameB = randIdent(8);
+  const saltNameC = randIdent(8);
   // split seed into ASCII fragments; store as hex pairs so file encoding cannot corrupt
   const seedHex = Buffer.from(seedStr, "utf8").toString("hex"); // only 0-9a-f
-  const nFrag = 3 + randInt(0, 1);
+  const nFrag = 4 + randInt(0, 2);
   const fragSize = Math.ceil(seedHex.length / nFrag);
   const seedFrags = [];
   for (let i = 0; i < seedHex.length; i += fragSize) {
@@ -1118,6 +1127,7 @@ function emitBcVm(blob, alph, pad, keyMat, op) {
       `(${num(a)}+${num(b)})%4294967296`,
       `(${num(n ^ 0xffff)}~${num(0xffff)})%4294967296`,
       `(${num(Math.floor(n/3))}*3+${num(n%3)})%4294967296`,
+      `(${num(a)}*${num(1)}+${num(b)})%4294967296`,
     ];
     return forms[randInt(0, forms.length - 1)];
   }
@@ -1137,7 +1147,10 @@ function emitBcVm(blob, alph, pad, keyMat, op) {
     .join("\n");
   const OP = (k) => opId[k]; // helper for template
 
-  // Polymorphic anti (order shuffled; predicates must be safe)
+  const intensity = keyMat.intensity || "v3";
+  const heavy = intensity === "v4" || intensity === "v5";
+
+  // Polymorphic anti (env integrity + getinfo/debug checks)
   const antiParts = [
     `if type(string)~="table" or type(string.char)~="function" then while true do end end`,
     `if type(table)~="table" or type(table.concat)~="function" then while true do end end`,
@@ -1145,12 +1158,22 @@ function emitBcVm(blob, alph, pad, keyMat, op) {
     `if select("#",1,2)~=2 then while true do end end`,
     `if (1==1)==false then while true do end end`,
     `if type(type)~="function" then while true do end end`,
+    `if type(pcall)~="function" or type(error)~="function" then while true do end end`,
+    `if type(rawget)~="function" or type(rawset)~="function" then while true do end end`,
+    `if type(tostring)~="function" or type(tonumber)~="function" then while true do end end`,
+    `do local _t=type; if _t(_t)~="function" then while true do end end end`,
+    // anti-debug / getinfo (safe even if debug is nil)
+    `do local ok,d=pcall(function() return debug end); if ok and type(d)=="table" and type(d.getinfo)=="function" then local i=d.getinfo(1,"S"); if i and (i.what=="C" or (type(i.source)=="string" and #i.source>0 and i.source:sub(1,1)~="@" and i.source:sub(1,1)~="=")) then end end end`,
+    `do local ok,d=pcall(function() return debug end); if ok and d and type(d.sethook)=="function" then pcall(d.sethook) end end`,
+    `if type(getfenv)=="function" then local e=getfenv(0); if type(e)~="table" then while true do end end end`,
+    `do local a,b=1,2; if a+b~=3 or a*b~=2 then while true do end end end`,
   ];
   for (let i = antiParts.length - 1; i > 0; i--) {
     const j = randInt(0, i);
     [antiParts[i], antiParts[j]] = [antiParts[j], antiParts[i]];
   }
-  const anti = antiParts.slice(0, 3 + randInt(0, 2)).join("\n") + "\n";
+  const antiCount = heavy ? 7 + randInt(0, 4) : 4 + randInt(0, 3);
+  const anti = antiParts.slice(0, Math.min(antiCount, antiParts.length)).join("\n") + "\n";
 
   let body = `
 return (function(...)
@@ -1179,16 +1202,20 @@ if state==0 then state=1 end
 local out={}
 for i=1,#bytes do
 state=(state*(${cMul})+(${cAdd}))%4294967296
-local k=math.floor(state/65536)%256
-out[i]=${N.bx}(${N.bx}(bytes[i],key[((i-1)%#key)+1]),${N.bx}(k,(i-1)*131%256))
+local k1=key[((i-1)%#key)+1]
+local k2=key[(((i-1)*7+3)%#key)+1]
+local mix=(math.floor(state/65536)%256)~((i-1)*131%256)~(math.floor(state/256)%256)
+out[i]=${N.bx}(${N.bx}(${N.bx}(bytes[i],k1),k2),mix)
+state=(state~((out[i] or 0)* (2^(((i-1)%4)*8))))%4294967296
 end
 return out
 end
 ${opLocals}
-local ${randIdent(8)}={${[...Array(16)].map(()=>num(randInt(0,255))).join(",")}}
-local ${randIdent(8)}={${[...Array(16)].map(()=>num(randInt(0,255))).join(",")}}
+local ${randIdent(8)}={${[...Array(24)].map(()=>num(randInt(0,255))).join(",")}}
+local ${randIdent(8)}={${[...Array(24)].map(()=>num(randInt(0,255))).join(",")}}
 local ${saltNameA}=${num(saltA)}
 local ${saltNameB}=${num(saltB)}
+local ${saltNameC}=${num(saltC || randInt(1,0x7fffffff))}
 local ${maskName}=${num(seedMask)}
 ${fragNames.map((fn,i)=>`local ${fn}="${escLuaStr(seedFrags[i])}"`).join("\n")}
 local ${seedName}=${fragNames.join("..")}
@@ -1203,8 +1230,8 @@ ${seedName}=table.concat(t)
 end
 local ${keyName}={}
 do
-local s=(${saltNameA}~${saltNameB}~(${cXor}))%4294967296
-for i=1,16 do
+local s=(${saltNameA}~${saltNameB}~${saltNameC}~(${cXor}))%4294967296
+for i=1,32 do
 local b=${seedName}:byte(((i-1)%#${seedName})+1)
 s=((s~b)*(${cMul})+(${cAdd}))%4294967296
 local sh=((i-1)%4)*8
@@ -1262,17 +1289,24 @@ if _c and _c.e then _z=_z+#_c.e end
 end
 if _z<0 then while true do end end
 end
+local ${N.code}_opx=((${keyName}[1]*256)~${keyName}[2]~(${keyName}[3]*16)~0xA5A5)%65536
 local function ${N.code}_at(i)
 local v=${N.code}[i]
 if not v then return 0 end
 local kb=${keyName}[((i-1)%#${keyName})+1]
+local kb2=${keyName}[(((i-1)*3)%#${keyName})+1]
 local mix=((i-1)*0x9E3779B9)%4294967296
-local st=(mix - mix%256 + ${N.bx}(kb,mix%256))%4294967296
+local st=${N.bx}(${N.bx}(kb,mix%256),kb2)
+st=(st+(mix-mix%256))%4294967296
 st=(st*1664525+1013904223)%4294967296
+st=((st~(((i-1)*0x85EBCA6B)%4294967296))*1664525+1013904223)%4294967296
 local mask=math.floor(st/65536)%65536
 local lo=${N.bx}(v%256,mask%256)
 local hi=${N.bx}(math.floor(v/256)%256,math.floor(mask/256)%256)
-return lo+hi*256
+local raw=lo+hi*256
+-- undo opcode virtualization layer
+local vx=(${N.code}_opx+((i-1)*0x45D9))%65536
+return ${N.bx}(raw%256,vx%256)+${N.bx}(math.floor(raw/256)%256,math.floor(vx/256)%256)*256
 end
 local ${N.env}=(type(_G)=="table" and _G) or {}
 local function ${N.vm}(...)
@@ -1280,61 +1314,70 @@ local ${N.st}={} local ${N.sp}=0 local ${N.pc}=1
 local ${N.locals}={}
 local function push(v) ${N.sp}=${N.sp}+1 ${N.st}[${N.sp}]=v end
 local function pop() local v=${N.st}[${N.sp}] ${N.st}[${N.sp}]=nil ${N.sp}=${N.sp}-1 return v end
-while ${N.pc}<=ncode do
-local op=${N.code}_at(${N.pc}) ${N.pc}=${N.pc}+1
-if op==${OP("LOADK")} then
+local ${N.vm}_ret
+local ${N.vm}_H={}
+${N.vm}_H[${OP("LOADK")}]=function()
 local idx=${N.code}_at(${N.pc}) ${N.pc}=${N.pc}+1
 push(${N.kn}_get(idx+1))
-elseif op==${OP("LOADNIL")} then push(nil)
-elseif op==${OP("LOADBOOL")} then
+end
+${N.vm}_H[${OP("LOADNIL")}]=function() push(nil) end
+${N.vm}_H[${OP("LOADBOOL")}]=function()
 local v=${N.code}_at(${N.pc}) ${N.pc}=${N.pc}+1
 push(v~=0)
-elseif op==${OP("GETGLOBAL")} then
+end
+${N.vm}_H[${OP("GETGLOBAL")}]=function()
 local idx=${N.code}_at(${N.pc}) ${N.pc}=${N.pc}+1
 local name=${N.kn}_get(idx+1)
 local v=rawget(${N.env},name)
 if v==nil then v=_G[name] end
 push(v)
-elseif op==${OP("SETGLOBAL")} then
+end
+${N.vm}_H[${OP("SETGLOBAL")}]=function()
 local idx=${N.code}_at(${N.pc}) ${N.pc}=${N.pc}+1
 local name=${N.kn}_get(idx+1)
 local val=pop()
 if type(${N.env})=="table" then rawset(${N.env},name,val) else _G[name]=val end
-elseif op==${OP("GETLOCAL")} then
+end
+${N.vm}_H[${OP("GETLOCAL")}]=function()
 local slot=${N.code}_at(${N.pc}) ${N.pc}=${N.pc}+1
 push(${N.locals}[slot])
-elseif op==${OP("SETLOCAL")} then
+end
+${N.vm}_H[${OP("SETLOCAL")}]=function()
 local slot=${N.code}_at(${N.pc}) ${N.pc}=${N.pc}+1
 ${N.locals}[slot]=pop()
-elseif op==${OP("ADD")} then local b,a=pop(),pop() push(a+b)
-elseif op==${OP("SUB")} then local b,a=pop(),pop() push(a-b)
-elseif op==${OP("MUL")} then local b,a=pop(),pop() push(a*b)
-elseif op==${OP("DIV")} then local b,a=pop(),pop() push(a/b)
-elseif op==${OP("MOD")} then local b,a=pop(),pop() push(a%b)
-elseif op==${OP("POW")} then local b,a=pop(),pop() push(a^b)
-elseif op==${OP("CONCAT")} then local b,a=pop(),pop() push(tostring(a)..tostring(b))
-elseif op==${OP("EQ")} then local b,a=pop(),pop() push(a==b)
-elseif op==${OP("NE")} then local b,a=pop(),pop() push(a~=b)
-elseif op==${OP("LT")} then local b,a=pop(),pop() push(a<b)
-elseif op==${OP("LE")} then local b,a=pop(),pop() push(a<=b)
-elseif op==${OP("GT")} then local b,a=pop(),pop() push(a>b)
-elseif op==${OP("GE")} then local b,a=pop(),pop() push(a>=b)
-elseif op==${OP("NOT")} then push(not pop())
-elseif op==${OP("UNM")} then push(-pop())
-elseif op==${OP("LEN")} then push(#pop())
-elseif op==${OP("JMP")} then
+end
+${N.vm}_H[${OP("ADD")}]=function() local b,a=pop(),pop() push(a+b) end
+${N.vm}_H[${OP("SUB")}]=function() local b,a=pop(),pop() push(a-b) end
+${N.vm}_H[${OP("MUL")}]=function() local b,a=pop(),pop() push(a*b) end
+${N.vm}_H[${OP("DIV")}]=function() local b,a=pop(),pop() push(a/b) end
+${N.vm}_H[${OP("MOD")}]=function() local b,a=pop(),pop() push(a%b) end
+${N.vm}_H[${OP("POW")}]=function() local b,a=pop(),pop() push(a^b) end
+${N.vm}_H[${OP("CONCAT")}]=function() local b,a=pop(),pop() push(tostring(a)..tostring(b)) end
+${N.vm}_H[${OP("EQ")}]=function() local b,a=pop(),pop() push(a==b) end
+${N.vm}_H[${OP("NE")}]=function() local b,a=pop(),pop() push(a~=b) end
+${N.vm}_H[${OP("LT")}]=function() local b,a=pop(),pop() push(a<b) end
+${N.vm}_H[${OP("LE")}]=function() local b,a=pop(),pop() push(a<=b) end
+${N.vm}_H[${OP("GT")}]=function() local b,a=pop(),pop() push(a>b) end
+${N.vm}_H[${OP("GE")}]=function() local b,a=pop(),pop() push(a>=b) end
+${N.vm}_H[${OP("NOT")}]=function() push(not pop()) end
+${N.vm}_H[${OP("UNM")}]=function() push(-pop()) end
+${N.vm}_H[${OP("LEN")}]=function() push(#pop()) end
+${N.vm}_H[${OP("JMP")}]=function()
 local off=${N.code}_at(${N.pc}) ${N.pc}=${N.pc}+1
 if off>=0x8000 then off=off-0x10000 end
 ${N.pc}=${N.pc}+off
-elseif op==${OP("JMPIF")} then
+end
+${N.vm}_H[${OP("JMPIF")}]=function()
 local off=${N.code}_at(${N.pc}) ${N.pc}=${N.pc}+1
 if off>=0x8000 then off=off-0x10000 end
 if pop() then ${N.pc}=${N.pc}+off end
-elseif op==${OP("JMPIFNOT")} then
+end
+${N.vm}_H[${OP("JMPIFNOT")}]=function()
 local off=${N.code}_at(${N.pc}) ${N.pc}=${N.pc}+1
 if off>=0x8000 then off=off-0x10000 end
 if not pop() then ${N.pc}=${N.pc}+off end
-elseif op==${OP("CALL")} then
+end
+${N.vm}_H[${OP("CALL")}]=function()
 local nargs=${N.code}_at(${N.pc}) ${N.pc}=${N.pc}+1
 local nrets=${N.code}_at(${N.pc}) ${N.pc}=${N.pc}+1
 local args={}
@@ -1347,30 +1390,38 @@ elseif nrets>1 then for i=1,nrets do push(rets[i]) end
 elseif nrets==0 then
 else for i=1,rets.n do push(rets[i]) end end
 else push(nil) end
-elseif op==${OP("RETURN")} then
+end
+${N.vm}_H[${OP("RETURN")}]=function()
 local n=${N.code}_at(${N.pc}) ${N.pc}=${N.pc}+1
 local rets={}
 for i=n,1,-1 do rets[i]=pop() end
-return table.unpack(rets,1,n)
-elseif op==${OP("POP")} then pop()
-elseif op==${OP("DUP")} then local v=pop() push(v) push(v)
-elseif op==${OP("NEWTABLE")} then push({})
-elseif op==${OP("GETTABLE")} then
+${N.vm}_ret=rets
+${N.vm}_ret.n=n
+${N.pc}=ncode+1
+end
+${N.vm}_H[${OP("POP")}]=function() pop() end
+${N.vm}_H[${OP("DUP")}]=function() local v=pop() push(v) push(v) end
+${N.vm}_H[${OP("NEWTABLE")}]=function() push({}) end
+${N.vm}_H[${OP("GETTABLE")}]=function()
 local key=pop() local tbl=pop()
 push(tbl[key])
-elseif op==${OP("SETTABLE")} then
+end
+${N.vm}_H[${OP("SETTABLE")}]=function()
 local key=pop() local val=pop() local tbl=pop()
 tbl[key]=val push(tbl)
-elseif op==${OP("SELF")} then
+end
+${N.vm}_H[${OP("SELF")}]=function()
 local key=pop() local obj=pop()
 push(obj[key]) push(obj)
-elseif op==${OP("SWAP")} then
+end
+${N.vm}_H[${OP("SWAP")}]=function()
 local a=pop() local b=pop() push(a) push(b)
-elseif op==${OP("HALT")} then break
-elseif op==${OP("CLOSURE")} then
+end
+${N.vm}_H[${OP("HALT")}]=function() ${N.pc}=ncode+1 end
+${N.vm}_H[${OP("CLOSURE")}]=function()
 local entry=${N.code}_at(${N.pc}) ${N.pc}=${N.pc}+1
 local nparams=${N.code}_at(${N.pc}) ${N.pc}=${N.pc}+1
-local code_ref, kn_ref, env_ref = ${N.code}, ${N.kn}, ${N.env}
+local env_ref=${N.env}
 push(function(...)
 local args=table.pack(...)
 local st={} local sp=0 local pc=entry
@@ -1378,26 +1429,52 @@ local locals={}
 for i=1,math.min(nparams,args.n) do locals[i-1]=args[i] end
 local function push2(v) sp=sp+1 st[sp]=v end
 local function pop2() local v=st[sp] st[sp]=nil sp=sp-1 return v end
-while pc<=ncode do
-local op2=${N.code}_at(pc) pc=pc+1
-if op2==${OP("LOADK")} then local idx=${N.code}_at(pc) pc=pc+1 push2(${N.kn}_get(idx+1))
-elseif op2==${OP("LOADNIL")} then push2(nil)
-elseif op2==${OP("LOADBOOL")} then local v=${N.code}_at(pc) pc=pc+1 push2(v~=0)
-elseif op2==${OP("GETGLOBAL")} then
+local ret2
+local H2={}
+H2[${OP("LOADK")}]=function() local idx=${N.code}_at(pc) pc=pc+1 push2(${N.kn}_get(idx+1)) end
+H2[${OP("LOADNIL")}]=function() push2(nil) end
+H2[${OP("LOADBOOL")}]=function() local v=${N.code}_at(pc) pc=pc+1 push2(v~=0) end
+H2[${OP("GETGLOBAL")}]=function()
 local idx=${N.code}_at(pc) pc=pc+1
 local name=${N.kn}_get(idx+1)
 push2(rawget(env_ref,name) or _G[name])
-elseif op2==${OP("GETLOCAL")} then local slot=${N.code}_at(pc) pc=pc+1 push2(locals[slot])
-elseif op2==${OP("SETLOCAL")} then local slot=${N.code}_at(pc) pc=pc+1 locals[slot]=pop2()
-elseif op2==${OP("ADD")} then local b,a=pop2(),pop2() push2(a+b)
-elseif op2==${OP("SUB")} then local b,a=pop2(),pop2() push2(a-b)
-elseif op2==${OP("MUL")} then local b,a=pop2(),pop2() push2(a*b)
-elseif op2==${OP("DIV")} then local b,a=pop2(),pop2() push2(a/b)
-elseif op2==${OP("CONCAT")} then local b,a=pop2(),pop2() push2(tostring(a)..tostring(b))
-elseif op2==${OP("EQ")} then local b,a=pop2(),pop2() push2(a==b)
-elseif op2==${OP("NE")} then local b,a=pop2(),pop2() push2(a~=b)
-elseif op2==${OP("LT")} then local b,a=pop2(),pop2() push2(a<b)
-elseif op2==${OP("CALL")} then
+end
+H2[${OP("SETGLOBAL")}]=function()
+local idx=${N.code}_at(pc) pc=pc+1
+local name=${N.kn}_get(idx+1)
+local val=pop2()
+if type(env_ref)=="table" then rawset(env_ref,name,val) else _G[name]=val end
+end
+H2[${OP("GETLOCAL")}]=function() local slot=${N.code}_at(pc) pc=pc+1 push2(locals[slot]) end
+H2[${OP("SETLOCAL")}]=function() local slot=${N.code}_at(pc) pc=pc+1 locals[slot]=pop2() end
+H2[${OP("ADD")}]=function() local b,a=pop2(),pop2() push2(a+b) end
+H2[${OP("SUB")}]=function() local b,a=pop2(),pop2() push2(a-b) end
+H2[${OP("MUL")}]=function() local b,a=pop2(),pop2() push2(a*b) end
+H2[${OP("DIV")}]=function() local b,a=pop2(),pop2() push2(a/b) end
+H2[${OP("MOD")}]=function() local b,a=pop2(),pop2() push2(a%b) end
+H2[${OP("POW")}]=function() local b,a=pop2(),pop2() push2(a^b) end
+H2[${OP("CONCAT")}]=function() local b,a=pop2(),pop2() push2(tostring(a)..tostring(b)) end
+H2[${OP("EQ")}]=function() local b,a=pop2(),pop2() push2(a==b) end
+H2[${OP("NE")}]=function() local b,a=pop2(),pop2() push2(a~=b) end
+H2[${OP("LT")}]=function() local b,a=pop2(),pop2() push2(a<b) end
+H2[${OP("LE")}]=function() local b,a=pop2(),pop2() push2(a<=b) end
+H2[${OP("GT")}]=function() local b,a=pop2(),pop2() push2(a>b) end
+H2[${OP("GE")}]=function() local b,a=pop2(),pop2() push2(a>=b) end
+H2[${OP("NOT")}]=function() push2(not pop2()) end
+H2[${OP("UNM")}]=function() push2(-pop2()) end
+H2[${OP("LEN")}]=function() push2(#pop2()) end
+H2[${OP("JMP")}]=function()
+local off=${N.code}_at(pc) pc=pc+1 if off>=0x8000 then off=off-0x10000 end pc=pc+off
+end
+H2[${OP("JMPIF")}]=function()
+local off=${N.code}_at(pc) pc=pc+1 if off>=0x8000 then off=off-0x10000 end
+if pop2() then pc=pc+off end
+end
+H2[${OP("JMPIFNOT")}]=function()
+local off=${N.code}_at(pc) pc=pc+1 if off>=0x8000 then off=off-0x10000 end
+if not pop2() then pc=pc+off end
+end
+H2[${OP("CALL")}]=function()
 local na=${N.code}_at(pc) pc=pc+1 local nr=${N.code}_at(pc) pc=pc+1
 local a2={} for i=na,1,-1 do a2[i]=pop2() end
 local fn=pop2()
@@ -1407,47 +1484,39 @@ if nr==1 then push2(rets[1])
 elseif nr>1 then for i=1,nr do push2(rets[i]) end
 else for i=1,rets.n do push2(rets[i]) end end
 else push2(nil) end
-elseif op2==${OP("RETURN")} then
+end
+H2[${OP("RETURN")}]=function()
 local n=${N.code}_at(pc) pc=pc+1
 local rets={} for i=n,1,-1 do rets[i]=pop2() end
-return table.unpack(rets,1,n)
-elseif op2==${OP("POP")} then pop2()
-elseif op2==${OP("GETTABLE")} then local key=pop2() local tbl=pop2() push2(tbl[key])
-elseif op2==${OP("SETTABLE")} then
+ret2=rets ret2.n=n pc=ncode+1
+end
+H2[${OP("POP")}]=function() pop2() end
+H2[${OP("DUP")}]=function() local v=pop2() push2(v) push2(v) end
+H2[${OP("NEWTABLE")}]=function() push2({}) end
+H2[${OP("GETTABLE")}]=function() local key=pop2() local tbl=pop2() push2(tbl[key]) end
+H2[${OP("SETTABLE")}]=function()
 local key=pop2() local val=pop2() local tbl=pop2()
 tbl[key]=val push2(tbl)
-elseif op2==${OP("SETGLOBAL")} then
-local idx=${N.code}_at(pc) pc=pc+1
-local name=${N.kn}_get(idx+1)
-local val=pop2()
-if type(env_ref)=="table" then rawset(env_ref,name,val) else _G[name]=val end
-elseif op2==${OP("SELF")} then
-local key=pop2() local obj=pop2()
-push2(obj[key]) push2(obj)
-elseif op2==${OP("SWAP")} then
-local a=pop2() local b=pop2() push2(a) push2(b)
-elseif op2==${OP("NEWTABLE")} then push2({})
-elseif op2==${OP("NOT")} then push2(not pop2())
-elseif op2==${OP("UNM")} then push2(-pop2())
-elseif op2==${OP("LEN")} then push2(#pop2())
-elseif op2==${OP("LE")} then local b,a=pop2(),pop2() push2(a<=b)
-elseif op2==${OP("GE")} then local b,a=pop2(),pop2() push2(a>=b)
-elseif op2==${OP("GT")} then local b,a=pop2(),pop2() push2(a>b)
-elseif op2==${OP("MOD")} then local b,a=pop2(),pop2() push2(a%b)
-elseif op2==${OP("POW")} then local b,a=pop2(),pop2() push2(a^b)
-elseif op2==${OP("DUP")} then local v=pop2() push2(v) push2(v)
-elseif op2==${OP("JMP")} then
-local off=${N.code}_at(pc) pc=pc+1 if off>=0x8000 then off=off-0x10000 end pc=pc+off
-elseif op2==${OP("JMPIF")} then
-local off=${N.code}_at(pc) pc=pc+1 if off>=0x8000 then off=off-0x10000 end
-if pop2() then pc=pc+off end
-elseif op2==${OP("JMPIFNOT")} then
-local off=${N.code}_at(pc) pc=pc+1 if off>=0x8000 then off=off-0x10000 end
-if not pop2() then pc=pc+off end
-elseif op2==${OP("HALT")} then break
-else break end
+end
+H2[${OP("SELF")}]=function() local key=pop2() local obj=pop2() push2(obj[key]) push2(obj) end
+H2[${OP("SWAP")}]=function() local a=pop2() local b=pop2() push2(a) push2(b) end
+H2[${OP("HALT")}]=function() pc=ncode+1 end
+while pc<=ncode do
+local op2=${N.code}_at(pc) pc=pc+1
+local h2=H2[op2]
+if not h2 then break end
+h2()
+if ret2 then return table.unpack(ret2,1,ret2.n) end
 end
 end)
+end
+while ${N.pc}<=ncode do
+local op=${N.code}_at(${N.pc}) ${N.pc}=${N.pc}+1
+local h=${N.vm}_H[op]
+if not h then break end
+h()
+if ${N.vm}_ret then
+return table.unpack(${N.vm}_ret,1,${N.vm}_ret.n)
 end
 end
 end
@@ -1462,21 +1531,28 @@ end)(...)
 
 
 
-  // v4 skins: junk + decoy table + shell wrap (safe)
+  // polymorphic skins: junk + decoy + shell wrap (scales with intensity)
+  const heavySkin = (keyMat.intensity === "v4" || keyMat.intensity === "v5");
   const junk = [];
-  for (let i = 0; i < 2 + (shell % 4); i++) {
+  const junkN = (heavySkin ? 6 : 2) + (shell % 6);
+  for (let i = 0; i < junkN; i++) {
     junk.push(`local ${randIdent(6)}=${num(randInt(0, 0xffffff))}`);
   }
   const decoy = randIdent(8);
   const decoyEntries = [];
-  for (let i = 0; i < 3 + (shell % 5); i++) {
+  for (let i = 0; i < (heavySkin ? 8 : 3) + (shell % 7); i++) {
     decoyEntries.push(`[${num(randInt(1000, 60000))}]=function(...) end`);
   }
   junk.push(`local ${decoy}={${decoyEntries.join(",")}}`);
+  if (heavySkin) {
+    const tmp = randIdent(5);
+    junk.push(`local ${randIdent(7)}=function(...) local ${tmp}={...} return #${tmp} end`);
+  }
   const prefix = junk.join("\n");
   let wrapped = `${prefix}\n${body}`;
-  if (shell % 3 === 0) wrapped = `${prefix}\ndo\n${body}\nend`;
-  else if (shell % 3 === 1) wrapped = `local ${randIdent(5)}=${num(variant)}\n${prefix}\n${body}`;
+  if (shell % 4 === 0) wrapped = `${prefix}\ndo\n${body}\nend`;
+  else if (shell % 4 === 1) wrapped = `local ${randIdent(5)}=${num(variant)}\n${prefix}\n${body}`;
+  else if (shell % 4 === 2) wrapped = `${prefix}\n(function()\n${body}\nend)()`;
   wrapped = `-- euana-vm/${variant}\n` + wrapped;
   return wrapped;
 }
@@ -1496,66 +1572,95 @@ function emitBytecodeObfuscation(src, intensity) {
     return { ok: false, errors: result.errors };
   }
   let { code, constants, op } = result;
+  const origConstCount = result.constants.length;
 
-  // Heavy noise — real constants buried among many fakes
-  const noise = { v1: 8, v2: 18, v3: 36 }[intensity] || 18;
+  // Heavy noise — real constants buried among many fakes (Luraph-style density)
+  const noise = { v1: 16, v2: 42, v3: 96, v4: 160, v5: 280 }[intensity] || 42;
   for (let i = 0; i < noise; i++) {
     constants.push(randInt(0x1000, 0xffffff));
-    constants.push(randIdent(randInt(6, 14)));
-    if (Math.random() < 0.4) constants.push(randIdent(randInt(4, 10)) + randIdent(4));
+    constants.push(randIdent(randInt(6, 16)));
+    if (Math.random() < 0.55) constants.push(randIdent(randInt(4, 12)) + randIdent(4));
+    if (Math.random() < 0.25) constants.push(randInt(0, 0xffffffff));
   }
-  // Force minimum complexity for tiny scripts (e.g. print(1))
-  while (constants.length < 24) {
+  const minConsts = { v1: 48, v2: 64, v3: 96, v4: 128, v5: 192 }[intensity] || 64;
+  while (constants.length < minConsts) {
     constants.push(randInt(100, 0xffffff));
-    constants.push(randIdent(8));
+    constants.push(randIdent(9));
   }
-  // Shuffle constant table so index 0/1 are not always the real ones
-  // (compiler already interned; we only append noise after, so real ones stay low —
-  // extra: inject noise at front by rebuilding)
-  const realConsts = constants.slice(0, result.constants.length);
-  const noiseConsts = constants.slice(result.constants.length);
+
+  // Full interleave + remap (real constants no longer sit at low indices)
+  const realConsts = constants.slice(0, origConstCount);
+  const noiseConsts = constants.slice(origConstCount);
   for (let i = noiseConsts.length - 1; i > 0; i--) {
     const j = randInt(0, i);
     [noiseConsts[i], noiseConsts[j]] = [noiseConsts[j], noiseConsts[i]];
   }
-  // Keep real constants but interleave noise so linear scan is noisier
   const mixed = [];
+  const remap = new Array(origConstCount); // oldIdx -> newIdx
   let ri = 0, ni = 0;
+  const bias = intensity === "v5" || intensity === "v4" ? 0.72 : 0.62;
   while (ri < realConsts.length || ni < noiseConsts.length) {
-    if (ni < noiseConsts.length && (ri >= realConsts.length || Math.random() < 0.55)) {
+    if (ni < noiseConsts.length && (ri >= realConsts.length || Math.random() < bias)) {
       mixed.push(noiseConsts[ni++]);
     } else if (ri < realConsts.length) {
+      remap[ri] = mixed.length;
       mixed.push(realConsts[ri++]);
     }
   }
-  // Remap code LOADK indices — skip for now (would need full remap). Keep original order + trailing noise.
-  constants = result.constants.concat(noiseConsts);
+  constants = mixed;
 
-  // Pick one of ~100 VM profiles (mixMul x shell; LCG coeffs stay IEEE-safe)
-  const variant = randInt(0, 99);
+  // Remap every const-index operand in the bytecode stream
+  // Opcodes that take a single const index as immediate: LOADK, GETGLOBAL, SETGLOBAL
+  const opConstIdx = new Set([op.LOADK, op.GETGLOBAL, op.SETGLOBAL]);
+  // Operand width table (how many immediates follow the opcode)
+  const opArity = {
+    [op.LOADK]: 1, [op.LOADBOOL]: 1, [op.GETGLOBAL]: 1, [op.SETGLOBAL]: 1,
+    [op.JMP]: 1, [op.JMPIF]: 1, [op.JMPIFNOT]: 1,
+    [op.CALL]: 2, [op.RETURN]: 1, [op.GETLOCAL]: 1, [op.SETLOCAL]: 1,
+    [op.CLOSURE]: 2,
+  };
+  for (let i = 0; i < code.length; ) {
+    const opc = code[i++];
+    const arity = opArity[opc] || 0;
+    if (opConstIdx.has(opc) && arity >= 1 && i < code.length) {
+      const oldIdx = code[i];
+      if (typeof oldIdx === "number" && oldIdx >= 0 && oldIdx < remap.length && remap[oldIdx] !== undefined) {
+        code[i] = remap[oldIdx];
+      }
+      i += arity;
+    } else {
+      i += arity;
+    }
+  }
+
+  // Pick one of ~160 VM profiles
+  const variant = randInt(0, 159);
   const MIX_MULS = [
     0x9e3779b9, 0x6c078965, 0x85ebca6b, 0xc2b2ae35, 0x27d4eb2d,
-    0x165667b1, 0x94d049bb, 0x7f4a7c15, 0x5bd1e995, 0x1b873593
+    0x165667b1, 0x94d049bb, 0x7f4a7c15, 0x5bd1e995, 0x1b873593,
+    0x243f6a88, 0xb7e15163
   ];
-  // only small LCG multipliers safe in Lua double * then % 2^32
-  const mixMul = 0x9e3779b9;
+  const mixMul = MIX_MULS[variant % MIX_MULS.length];
   const mixA = 1664525;
   const mixB = 1013904223;
-  const shell = Math.floor(variant / 10) % 10; // structural shell 0..9
+  const shell = Math.floor(variant / 10) % 16;
 
-  const seedStr = crypto.randomBytes(32).toString("base64");
+  const seedStr = crypto.randomBytes(intensity === "v5" ? 64 : 48).toString("base64");
   const saltA = randInt(1, 0x7fffffff);
   const saltB = randInt(1, 0x7fffffff);
-  const key = Buffer.alloc(16);
-  let ds = (saltA >>> 0) ^ (saltB >>> 0) ^ 0xa5a5a5a5;
-  for (let i = 0; i < 16; i++) {
+  const saltC = randInt(1, 0x7fffffff);
+  const key = Buffer.alloc(32);
+  let ds = (saltA >>> 0) ^ (saltB >>> 0) ^ (saltC >>> 0) ^ 0xa5a5a5a5;
+  for (let i = 0; i < 32; i++) {
     ds = (Math.imul(ds ^ seedStr.charCodeAt(i % seedStr.length), 1664525) + 1013904223) >>> 0;
     key[i] = (ds >>> ((i % 4) * 8)) & 0xff;
   }
   const packed = packProgram(code, constants, key);
   const enc = encodeBc(packed, key);
   const { b85: blob, alph, pad } = b85(enc);
-  const out = emitBcVm(blob, alph, pad, { seedStr, saltA, saltB, mixMul, mixA, mixB, shell, variant }, op);
+  const out = emitBcVm(blob, alph, pad, {
+    seedStr, saltA, saltB, saltC, mixMul, mixA, mixB, shell, variant, intensity
+  }, op);
   return { ok: true, code: out, mode: "bytecode", variant };
 }
 
@@ -1567,7 +1672,7 @@ function emitBytecodeObfuscation(src, intensity) {
  */
 
 const APP_NAME = "Euana";
-const VERSION = "4.1.0";
+const VERSION = "5.2.0"; // +nested handler table, sparse opcode virt, position XOR layer
 
 function randInt(a, b) {
   return a + Math.floor(Math.random() * (b - a + 1));
@@ -1712,7 +1817,7 @@ function antiBundle(intensity) {
   parts.push(
     `if type(${f1})~="function" or type(${f2})~="function" then while true do end end`
   );
-  if (intensity === "v2" || intensity === "v3") {
+  if (intensity === "v2" || intensity === "v3" || intensity === "v4" || intensity === "v5") {
     parts.push(
       `if type(string)~="table" or type(string.char)~="function" then while true do end end`
     );
@@ -1724,7 +1829,7 @@ function antiBundle(intensity) {
     );
     parts.push(`if ${opaqueFalse()} then ${f2}(${num(0)}) while true do end end`);
   }
-  if (intensity === "v3") {
+  if (intensity === "v3" || intensity === "v4" || intensity === "v5") {
     parts.push(
       `do local _t=type if _t(_t)~="function" then while true do end end end`
     );
@@ -1739,12 +1844,23 @@ function antiBundle(intensity) {
       `if select("#", ${num(1)}, ${num(2)}) ~= ${num(2)} then while true do end end`
     );
   }
+  if (intensity === "v4" || intensity === "v5") {
+    parts.push(
+      `do local ok,d=pcall(function() return debug end); if ok and type(d)=="table" and type(d.getinfo)=="function" then local i=d.getinfo(1,"S"); if i and i.what=="C" then end end end`
+    );
+    parts.push(
+      `if type(pcall)~="function" or type(rawget)~="function" then while true do end end`
+    );
+    for (let i = 0; i < (intensity === "v5" ? 8 : 5); i++) {
+      parts.push(`do local ${randIdent()}=${num(randInt(100, 0xffffff))} end`);
+    }
+  }
   return parts.join(" ");
 }
 
 function emitVm(src, intensity) {
   const raw = Buffer.from(src, "utf8");
-  let nChunks = { v1: 3, v2: 5, v3: 8 }[intensity] || 5;
+  let nChunks = { v1: 3, v2: 5, v3: 8, v4: 10, v5: 14 }[intensity] || 5;
   if (raw.length > 200000) nChunks = Math.min(24, nChunks + 8);
   else if (raw.length > 50000) nChunks = Math.min(16, nChunks + 4);
 
@@ -2001,7 +2117,7 @@ function leaksPlainSource(output, source) {
 function obfuscateCode(code, intensity = "v3") {
   code = (code || "").trim();
   if (!code) return "-- empty";
-  if (!["v1", "v2", "v3"].includes(intensity)) intensity = "v3";
+  if (!["v1", "v2", "v3", "v4", "v5"].includes(intensity)) intensity = "v3";
 
   if (!obfuscateCode._tested) {
     selfTestCrypto();
@@ -2030,15 +2146,15 @@ function obfuscateCode(code, intensity = "v3") {
     /* fall through */
   }
 
-  // 2) Encrypted envelope — source only inside ciphertext chunks
-  let layers = { v1: 2, v2: 3, v3: 5 }[intensity] || 3;
+  // 2) Encrypted envelope — source only inside ciphertext chunks (boosted layers)
+  let layers = { v1: 3, v2: 4, v3: 7, v4: 9, v5: 12 }[intensity] || 4;
   if (src.length > 500000) layers = Math.min(layers, 2);
   else if (src.length > 150000) layers = Math.min(layers, 3);
-  else if (src.length > 50000) layers = Math.min(layers, 4);
+  else if (src.length > 50000) layers = Math.min(layers, 5);
 
   let current = src;
   for (let i = 0; i < layers; i++) {
-    const li = intensity === "v3" ? "v3" : i === layers - 1 ? intensity : "v1";
+    const li = (intensity === "v3" || intensity === "v4" || intensity === "v5") ? "v3" : i === layers - 1 ? intensity : "v1";
     current = emitVm(current, li);
   }
 
@@ -2090,7 +2206,83 @@ function runTests() {
   console.log(pass + " pass / " + fail + " fail");
   process.exit(fail ? 1 : 0);
 }
+
+/**
+ * Luraph API client (https://api.lura.ph/v1)
+ * Auth: Luraph-API-Key header — get key from https://lura.ph/dashboard/account
+ * Env: LURAPH_API_KEY or LPH_API_KEY
+ */
+// Default Luraph key (prefer env LURAPH_API_KEY / LPH_API_KEY over this)
+const LURAPH_DEFAULT_KEY = "c0691d369dae361e1abb072d584a3c7084e7b8b9d522b33d308be7b84dded65c";
+
+async function luraphRequest(path, { method = "GET", body, apiKey, raw = false } = {}) {
+  const key = apiKey || process.env.LURAPH_API_KEY || process.env.LPH_API_KEY || LURAPH_DEFAULT_KEY;
+  if (!key) throw new Error("Luraph API key missing (set LURAPH_API_KEY)");
+  const url = new URL(path.replace(/^\//, ""), "https://api.lura.ph/v1/");
+  const res = await fetch(url, {
+    method,
+    headers: {
+      "Luraph-API-Key": key,
+      "Content-Type": "application/json",
+      Accept: "application/json",
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (raw) return res;
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const msg =
+      (data && (data.message || data.error)) ||
+      (Array.isArray(data.errors) && data.errors.map((e) => e.message || e).join("; ")) ||
+      `Luraph HTTP ${res.status}`;
+    throw new Error(String(msg));
+  }
+  return data;
+}
+
+async function luraphGetNodes(apiKey) {
+  return luraphRequest("obfuscate/nodes", { apiKey });
+}
+
+async function luraphObfuscate(script, options = {}) {
+  const apiKey = options.apiKey || process.env.LURAPH_API_KEY || process.env.LPH_API_KEY || LURAPH_DEFAULT_KEY;
+  if (!apiKey) throw new Error("Luraph API key missing (set LURAPH_API_KEY)");
+  const fileName = options.fileName || `euana-${Date.now()}.lua`;
+  const luraphOptions = options.options || {};
+  const useTokens = !!options.useTokens;
+  const enforceSettings = options.enforceSettings === true; // default false for fewer breaks
+
+  const nodes = await luraphGetNodes(apiKey);
+  const nodeId = options.node || nodes.recommendedId;
+  if (!nodeId) throw new Error("No Luraph node available");
+
+  const b64 = Buffer.from(String(script), "utf8").toString("base64");
+  const { jobId } = await luraphRequest("obfuscate/new", {
+    method: "POST",
+    apiKey,
+    body: {
+      node: nodeId,
+      script: b64,
+      fileName,
+      options: luraphOptions,
+      useTokens,
+      enforceSettings,
+    },
+  });
+  if (!jobId) throw new Error("Luraph did not return jobId");
+
+  // status endpoint blocks until done (server timeout ~60–180s)
+  const status = await luraphRequest(`obfuscate/status/${jobId}`, { apiKey });
+  if (status.error) throw new Error(String(status.error));
+
+  const dl = await luraphRequest(`obfuscate/download/${jobId}`, { apiKey, raw: true });
+  if (!dl.ok) throw new Error(`Luraph download failed (${dl.status})`);
+  const data = await dl.text();
+  return { code: data, jobId, nodeId, engine: "luraph" };
+}
+
 function serve(port) {
+
   port = Number(port) || Number(process.env.PORT) || 3000;
   const html = `<!DOCTYPE html>
 <html lang="ko">
@@ -2280,11 +2472,18 @@ function serve(port) {
     </header>
 
     <div class="toolbar">
+      <label style="font-size:0.85rem;color:var(--muted)">Engine</label>
+      <select id="engine">
+        <option value="euana" selected>Euana (local)</option>
+        <option value="luraph">Luraph API</option>
+      </select>
       <label style="font-size:0.85rem;color:var(--muted)">Intensity</label>
       <select id="iv">
         <option value="v1">v1 — Light</option>
         <option value="v2">v2 — Medium</option>
         <option value="v3" selected>v3 — Heavy</option>
+        <option value="v4">v4 — Extreme</option>
+        <option value="v5">v5 — Max</option>
       </select>
       <button class="primary" id="go">Obfuscate</button>
       <label class="file-btn" for="fileInput">Upload File</label>
@@ -2348,10 +2547,12 @@ go.onclick = async () => {
   status.className = "status";
   const t0 = performance.now();
   try {
+    const engineEl = document.getElementById("engine");
+    const engine = engineEl ? engineEl.value : "euana";
     const r = await fetch("/api/obfuscate", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ code: src.value, intensity: iv.value })
+      body: JSON.stringify({ code: src.value, intensity: iv.value, engine })
     });
     const j = await r.json();
     if (!r.ok) throw new Error(j.error || "Request failed");
@@ -2459,19 +2660,38 @@ document.getElementById("download").onclick = () => {
       res.end(html);
       return;
     }
+    if (req.method === "GET" && req.url === "/api/engines") {
+      const hasLuraph = !!(process.env.LURAPH_API_KEY || process.env.LPH_API_KEY || LURAPH_DEFAULT_KEY);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ engines: ["euana", "luraph"], luraphConfigured: hasLuraph, version: VERSION }));
+      return;
+    }
     if (req.method === "POST" && req.url === "/api/obfuscate") {
       let body = "";
       req.on("data", (c) => (body += c));
-      req.on("end", () => {
+      req.on("end", async () => {
         try {
           const j = JSON.parse(body || "{}");
+          const engine = (j.engine || "euana").toLowerCase();
+          let code;
+          let meta = { version: VERSION, engine };
+          if (engine === "luraph") {
+            const result = await luraphObfuscate(j.code || "", {
+              apiKey: j.apiKey,
+              options: j.luraphOptions || {},
+              fileName: j.fileName,
+              useTokens: j.useTokens,
+              enforceSettings: j.enforceSettings,
+              node: j.node,
+            });
+            code = result.code;
+            meta.jobId = result.jobId;
+            meta.nodeId = result.nodeId;
+          } else {
+            code = obfuscateCode(j.code || "", j.intensity || "v3");
+          }
           res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(
-            JSON.stringify({
-              code: obfuscateCode(j.code || "", j.intensity || "v3"),
-              version: VERSION,
-            })
-          );
+          res.end(JSON.stringify({ code, ...meta }));
         } catch (e) {
           res.writeHead(500);
           res.end(JSON.stringify({ error: String(e.message || e) }));
@@ -2489,11 +2709,11 @@ function mainCli() {
   if (args[0]==="--test") return runTests();
   if (args[0]==="--serve") return serve(args[1] || process.env.PORT);
   if (!args.length) {
-    console.log("Euana "+VERSION+"\n  node main.js <in.lua> [out.lua] [--v1|--v2|--v3]\n  node main.js --test\n  node main.js --serve [port]");
+    console.log("Euana "+VERSION+"\n  node main.js <in.lua> [out.lua] [--v1|--v2|--v3|--v4|--v5]\n  node main.js --test\n  node main.js --serve [port]");
     return;
   }
   let intensity="v3"; const files=[];
-  for (const a of args) { if (a==="--v1"||a==="--v2"||a==="--v3") intensity=a.slice(2); else files.push(a); }
+  for (const a of args) { if (a==="--v1"||a==="--v2"||a==="--v3"||a==="--v4"||a==="--v5") intensity=a.slice(2); else files.push(a); }
   const input=files[0], output=files[1]||input.replace(/\.lua$/i,"")+".obf.lua";
   const t0=Date.now();
   const out=obfuscateCode(fs.readFileSync(input,"utf8"), intensity);
@@ -2501,4 +2721,4 @@ function mainCli() {
   console.log("ok", output, out.length, "bytes", Date.now()-t0, "ms");
 }
 if (require.main===module) mainCli();
-module.exports = { obfuscateCode, VERSION, preprocessLuau, compileToBytecode, emitBytecodeObfuscation };
+module.exports = { obfuscateCode, luraphObfuscate, luraphGetNodes, VERSION, preprocessLuau, compileToBytecode, emitBytecodeObfuscation };
