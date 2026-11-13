@@ -7,7 +7,7 @@ const http = require("http");
 const { URL } = require("url");
 const crypto = require("crypto");
 const PORT = process.env.PORT || 3000;
-const VERSION = "2.6.0";
+const VERSION = "2.7.0";
 
 const RESERVED = new Set([
   "and","break","do","else","elseif","end","false","for","function","goto","if","in",
@@ -229,8 +229,8 @@ function emitHardVm(payloadSrc, opts) {
   const poolParts = [];
   for (let i = 0; i < chunks.length; i++) {
     poolParts.push(`{${chunks[i].join(",")}}`);
-    if (Math.random() > 0.35) {
-      const noise = Array.from({ length: 4 + ((Math.random() * 28) | 0) }, () => (Math.random() * 255) | 0);
+    if (Math.random() > 0.2) {
+      const noise = Array.from({ length: 8 + ((Math.random() * 48) | 0) }, () => (Math.random() * 255) | 0);
       poolParts.push(`{${noise.join(",")}}`);
     }
   }
@@ -240,14 +240,17 @@ function emitHardVm(payloadSrc, opts) {
   const antiParts = [
     `local function ${die}(m)return error(m or "KRPH",0)end`,
     `local function ${probe}()`,
-    `local s=string;`,
-    `if type(s)~="table" and type(s)~="string" then ${die}("H1") end;`,
-    `if type(s.char)~="function" then ${die}("H2") end;`,
+    `local s=string;local t=type;`,
+    `if t(s)~="table" and t(s)~="string" then ${die}("H1") end;`,
+    `if t(s.char)~="function" then ${die}("H2") end;`,
     `if s.char(65)~="A" or s.char(90)~="Z" then ${die}("H3") end;`,
-    `if type(loadstring)~="function" and type(load)~="function" then ${die}("H4") end;`,
+    `if t(s.byte)~="function" or s.byte("A")~=65 then ${die}("H5") end;`,
+    `if t(s.sub)~="function" then ${die}("H6") end;`,
+    `if t(loadstring)~="function" and t(load)~="function" then ${die}("H4") end;`,
+    // Roblox-safe: never require debug unless jail
     `return true end`,
     `local function ${env}()`,
-    `local ok=pcall(function()return type(_G)=="table" end);`,
+    `local ok=pcall(function()return type(_G)=="table" or type(shared)=="table" end);`,
     `if not ok then ${die}("E1") end;`,
     `return true end`,
     `local function ${chk}(x)`,
@@ -388,6 +391,7 @@ function obfuscateLua(input, options = {}) {
     double: options.double !== false,
     junk: options.junk !== false,
     jailbreak: !!options.jailbreak,
+    layers: Math.min(5, Math.max(1, parseInt(options.layers, 10) || (options.jailbreak ? 3 : 2))),
     // Luraph-style: always wipe original source by default
     wipe: options.wipe !== false
   };
@@ -399,6 +403,7 @@ function obfuscateLua(input, options = {}) {
     localsRenamed: 0,
     vm: false,
     jailbreak: opts.jailbreak,
+    layers: 0,
     wiped: false,
     mode: "none"
   };
@@ -456,20 +461,21 @@ function obfuscateLua(input, options = {}) {
 
   // After this point original source structure is gone — only encrypted payload remains
   if (opts.vm) {
+    const layers = opts.layers || (opts.jailbreak ? 3 : 2);
     const vmOpts = { minify: opts.minify, jailbreak: opts.jailbreak };
-    code = emitHardVm(code, vmOpts);
-    if (opts.jailbreak || opts.double) {
-      code = emitHardVm(code, vmOpts);
-      if (opts.jailbreak) {
-        code = emitHardVm(code, { minify: opts.minify, jailbreak: false });
-        stats.mode = "vm-cf-anti-jail-x3-wiped";
-      } else {
-        stats.mode = "vm-cf-anti-x2-wiped";
-      }
-    } else {
-      stats.mode = "vm-cf-anti-wiped";
+    for (let L = 0; L < layers; L++) {
+      // outer layers get heavier anti; innermost keeps full jail probes
+      const layerOpts = {
+        minify: opts.minify,
+        jailbreak: opts.jailbreak && L === 0,
+        layer: L,
+        totalLayers: layers
+      };
+      code = emitHardVm(code, layerOpts);
     }
+    stats.mode = "vm-x" + layers + (opts.jailbreak ? "-jail" : "") + (opts.wipe ? "-wiped" : "");
     stats.vm = true;
+    stats.layers = layers;
   } else {
     code = `--[[ This file was protected by KRPH | krph.onrender.com ]]\n` + code;
     stats.mode = opts.jailbreak ? "flat-jail-wiped" : "flat-wiped";
@@ -496,6 +502,7 @@ const HTML = `<!DOCTYPE html><html lang="ko"><head><meta charset="UTF-8"/><meta 
 <label><input type="checkbox" id="minify" checked/> minify</label>
 <label><input type="checkbox" id="wipe" checked/> wipe source</label>
 <label><input type="checkbox" id="jailbreak"/> jailbreak</label>
+<label>layers <select id="layers"><option value="1">1</option><option value="2" selected>2</option><option value="3">3</option><option value="4">4</option><option value="5">5</option></select></label>
 </div><div>
 <button class="pri" id="go">Obfuscate</button>
 <button id="copy">Copy</button>
@@ -513,7 +520,7 @@ const $=id=>document.getElementById(id);
 async function run(){
   $("err").hidden=true;$("stats").hidden=true;$("go").disabled=true;
   try{
-    const res=await fetch("/api/obfuscate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({code:$("in").value,options:{vm:$("vm").checked,strings:$("strings").checked,rename:$("rename").checked,minify:$("minify").checked,wipe:$("wipe").checked,jailbreak:$("jailbreak").checked}})});
+    const res=await fetch("/api/obfuscate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({code:$("in").value,options:{vm:$("vm").checked,strings:$("strings").checked,rename:$("rename").checked,minify:$("minify").checked,wipe:$("wipe").checked,jailbreak:$("jailbreak").checked,layers:parseInt($("layers").value,10)||2}})});
     const d=await res.json();
     if(!res.ok||!d.ok)throw new Error(d.error||"fail");
     $("out").value=d.code;
