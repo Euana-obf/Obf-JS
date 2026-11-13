@@ -1,20 +1,13 @@
 #!/usr/bin/env node
 /**
- * KRPH v2.3 — hostile single-file Lua/Luau obfuscator
- * Inspired by techniques seen in Luraph-style protectors (CF flatten, stream crypt, anti-tamper)
- * - Full Lua 5.1 + Luau syntax support (types stripped, compound ops kept, continue kept)
- * - Per-byte xorshift stream, multi-chunk pools, noise decoys
- * - Multi-layer CF state machine + dead handlers + opaque preds (float compares)
- * - Anti-tamper: string.char, load/loadstring, env, optional debug/getfenv probes
- * - Jailbreak mode: triple VM + heavier anti
- * - Wipe mode: original source traces erased
- * - Header: "This file was protected by KRPH"
+ * KRPH v2.4 — Lua/Luau obfuscator
+ * stream-pool · CF VM · anti-tamper · jailbreak · source wipe
  */
 const http = require("http");
 const { URL } = require("url");
 const crypto = require("crypto");
 const PORT = process.env.PORT || 3000;
-const VERSION = "2.3.0";
+const VERSION = "2.4.0";
 
 const RESERVED = new Set([
   "and","break","do","else","elseif","end","false","for","function","goto","if","in",
@@ -108,12 +101,19 @@ function preprocessLuau(code) {
   return code;
 }
 
-function wipeOriginalTraces(code) {
+/** Luraph-style: completely erase original source traces before encryption */
+function wipeOriginalSource(code) {
   code = stripComments(code);
   code = preprocessLuau(code);
-  code = code.replace(/[ \t]+/g, " ").replace(/\n{2,}/g, "\n").trim();
-  code = code.replace(/\b(TODO|FIXME|NOTE|DEBUG)\b/gi, "");
-  return code;
+  // collapse all whitespace to single spaces / minimal newlines
+  code = code.replace(/[ \t]+/g, " ");
+  code = code.replace(/\n+/g, "\n");
+  code = code.replace(/\n /g, "\n").replace(/ \n/g, "\n");
+  // kill human markers
+  code = code.replace(/\b(TODO|FIXME|NOTE|DEBUG|HACK|XXX)\b/gi, "");
+  // remove empty lines and trailing spaces
+  code = code.split("\n").map(l => l.trim()).filter(l => l.length > 0).join("\n");
+  return code.trim();
 }
 
 function extractStrings(code) {
@@ -164,7 +164,7 @@ function renameAll(code) {
   const map = new Map();
   const take = (n) => {
     if (RESERVED.has(n) || n.startsWith("__S")) return n;
-    if (!map.has(n)) map.set(n, rnd(10 + ((Math.random() * 5) | 0)));
+    if (!map.has(n)) map.set(n, rnd(11 + ((Math.random() * 6) | 0)));
     return map.get(n);
   };
   code = code.replace(
@@ -184,32 +184,33 @@ const BITPOLY = `if not bit32 then bit32={} function bit32.band(a,b)local r,v=0,
 
 function emitHardVm(payloadSrc, opts) {
   const jail = !!opts.jailbreak;
-  const seed = (crypto.randomBytes(4).readUInt32BE(0) ^ 0xa5a5a5a5) >>> 0;
+  const seed = (crypto.randomBytes(4).readUInt32BE(0) ^ 0xc3a5a5a5) >>> 0;
   const cipher = streamCrypt(strToBytes(payloadSrc), seed);
   const chunks = [];
   let off = 0;
   while (off < cipher.length) {
-    const n = 18 + ((Math.random() * 90) | 0);
+    const n = 16 + ((Math.random() * 96) | 0);
     chunks.push(cipher.slice(off, off + n));
     off += n;
   }
 
-  const die = rnd(6), probe = rnd(6), run = rnd(6), handlers = rnd(7);
-  const opT = rnd(6), opF = rnd(6), chk = rnd(5), env = rnd(5), antiH = rnd(5);
-  const labels = ["boot","probe","mix","boot2","call","halt","d1","d2","d3","d4","d5","d6","gate","verify","lock"];
+  const die = rnd(7), probe = rnd(7), run = rnd(7), handlers = rnd(8);
+  const opT = rnd(7), opF = rnd(7), chk = rnd(6), env = rnd(6), antiH = rnd(6);
+  const labels = ["boot","probe","mix","boot2","call","halt","d1","d2","d3","d4","d5","d6","gate","verify","lock","spin"];
   const S = {}, used = new Set();
   for (const lab of labels) {
-    let id = 15000 + ((Math.random() * 80000) | 0);
+    let id = 20000 + ((Math.random() * 90000) | 0);
     while (used.has(id)) id++;
     used.add(id);
     S[lab] = id;
   }
 
+  // interleave real chunks with decoy noise (Luraph-style junk in buffer)
   const poolParts = [];
   for (let i = 0; i < chunks.length; i++) {
     poolParts.push(`{${chunks[i].join(",")}}`);
-    if (Math.random() > 0.4) {
-      const noise = Array.from({ length: 5 + ((Math.random() * 22) | 0) }, () => (Math.random() * 255) | 0);
+    if (Math.random() > 0.35) {
+      const noise = Array.from({ length: 4 + ((Math.random() * 28) | 0) }, () => (Math.random() * 255) | 0);
       poolParts.push(`{${noise.join(",")}}`);
     }
   }
@@ -230,7 +231,7 @@ function emitHardVm(payloadSrc, opts) {
     `if not ok then ${die}("E1") end;`,
     `return true end`,
     `local function ${chk}(x)`,
-    `x=x or 0;local a=x*x-x+7;`,
+    `x=x or 0;local a=x*x-x+11;`,
     `if a<0 then ${die}("C1") end;`,
     `return a>0 end`
   ];
@@ -270,7 +271,7 @@ function emitHardVm(payloadSrc, opts) {
     `local parts,buf={},{};`,
     `for i=1,#out do`,
     `buf[#buf+1]=string.char(out[i]);`,
-    `if #buf>=32 then parts[#parts+1]=table.concat(buf);buf={} end`,
+    `if #buf>=28 then parts[#parts+1]=table.concat(buf);buf={} end`,
     `end;`,
     `if #buf>0 then parts[#parts+1]=table.concat(buf) end;`,
     `local src=table.concat(parts);`,
@@ -303,11 +304,12 @@ function emitHardVm(payloadSrc, opts) {
     `[${S.call}]=function(st,reg)local r=reg.fn(...);return ${S.halt},r end,`,
     `[${S.halt}]=function(st)return ${S.halt} end,`,
     `[${S.d1}]=function(st)if ${opF}(1)then return ${S.d3} end;return ${S.boot} end,`,
-    `[${S.d2}]=function(st)local _=0;for i=1,5 do _=_+i end;return ${S.d4} end,`,
+    `[${S.d2}]=function(st)local _=0;for i=1,6 do _=_+i end;return ${S.d4} end,`,
     `[${S.d3}]=function(st)return ${S.d1} end,`,
     `[${S.d4}]=function(st)return ${S.probe} end,`,
     `[${S.d5}]=function(st)if ${opF}(7)then return ${S.d6} end;return ${S.gate} end,`,
-    `[${S.d6}]=function(st)local t=0;for i=1,4 do t=t+i*i end;return ${S.d2} end`,
+    `[${S.d6}]=function(st)local t=0;for i=1,5 do t=t+i*i end;return ${S.spin} end,`,
+    `[${S.spin}]=function(st)return ${S.d2} end`,
     `}`
   ].join("");
 
@@ -317,7 +319,7 @@ function emitHardVm(payloadSrc, opts) {
     `local ret;`,
     `local guard=0;`,
     `while st~=${S.halt} do`,
-    `guard=guard+1;if guard>${jail ? 100 : 180} then ${die}("LOOP") end;`,
+    `guard=guard+1;if guard>${jail ? 90 : 160} then ${die}("LOOP") end;`,
     `local h=${handlers}[st];`,
     `if not h then ${die}("BAD") end;`,
     `local nst,r=h(st,reg);`,
@@ -332,7 +334,7 @@ function emitHardVm(payloadSrc, opts) {
     `end)(...)`
   ].join(" ");
 
-  const bannerTag = jail ? "CF+anti+jail | stream-pool" : "CF+anti | stream-pool";
+  const bannerTag = jail ? "CF+anti+jail | source-wiped" : "CF+anti | source-wiped";
   let body = [
     `--[[ This file was protected by KRPH v${VERSION} | ${bannerTag} ]]`,
     BITPOLY, opaque, anti, rebuild, h, driver
@@ -342,16 +344,17 @@ function emitHardVm(payloadSrc, opts) {
   return body;
 }
 
-function injectJunk(code, amount = 5) {
+function injectJunk(code, amount = 6) {
   let out = code;
   for (let i = 0; i < amount; i++) {
-    const a = rnd(6), b = rnd(5), v = (Math.random() * 1e7) | 0;
-    const style = (Math.random() * 5) | 0;
+    const a = rnd(7), b = rnd(6), v = (Math.random() * 1e8) | 0;
+    const style = (Math.random() * 6) | 0;
     if (style === 0) out = `local ${a}=${v};if ${a}<0 then local ${b}=${a}*2 end ` + out;
-    else if (style === 1) out = `local ${a}={${v},${(v ^ 0x55) >>> 0}};if #${a}<0 then end ` + out;
+    else if (style === 1) out = `local ${a}={${v},${(v ^ 0xaa) >>> 0}};if #${a}<0 then end ` + out;
     else if (style === 2) out = `local function ${a}()return ${v} end;if ${a}()<0 then end ` + out;
     else if (style === 3) out = `do local ${a}=${v};if ${a}~=${a} then end end ` + out;
-    else out = `local ${a}=function()return ${v}+0 end;pcall(${a});` + out;
+    else if (style === 4) out = `local ${a}=function()return ${v}+0 end;pcall(${a});` + out;
+    else out = `local ${a}=${v};for ${b}=1,0 do end ` + out;
   }
   return out;
 }
@@ -366,18 +369,24 @@ function obfuscateLua(input, options = {}) {
     double: options.double !== false,
     junk: options.junk !== false,
     jailbreak: !!options.jailbreak,
+    // Luraph-style: always wipe original source by default
     wipe: options.wipe !== false
   };
 
   let code = String(input || "");
   const stats = {
     originalBytes: Buffer.byteLength(code, "utf8"),
-    stringsEncoded: 0, localsRenamed: 0, vm: false,
-    jailbreak: opts.jailbreak, wiped: false, mode: "none"
+    stringsEncoded: 0,
+    localsRenamed: 0,
+    vm: false,
+    jailbreak: opts.jailbreak,
+    wiped: false,
+    mode: "none"
   };
 
+  // --- Luraph-style original source deletion ---
   if (opts.wipe) {
-    code = wipeOriginalTraces(code);
+    code = wipeOriginalSource(code);
     stats.wiped = true;
   } else {
     if (opts.stripComments) code = stripComments(code);
@@ -404,11 +413,11 @@ function obfuscateLua(input, options = {}) {
     for (let i = 0; i < strings.length; i++) {
       const sd = (seed ^ (i * 0x9e3779b9)) >>> 0;
       const enc = streamCrypt(strToBytes(strings[i]), sd);
-      const pool = rnd(8), fn = rnd(8);
+      const pool = rnd(9), fn = rnd(9);
       const sub = [];
       let o = 0;
       while (o < enc.length) {
-        const n = Math.min(enc.length - o, 8 + ((Math.random() * 32) | 0));
+        const n = Math.min(enc.length - o, 6 + ((Math.random() * 36) | 0));
         sub.push(enc.slice(o, o + n));
         o += n;
       }
@@ -422,10 +431,11 @@ function obfuscateLua(input, options = {}) {
   }
 
   if (opts.junk) {
-    const amount = opts.jailbreak ? 8 + ((Math.random() * 4) | 0) : 4 + ((Math.random() * 3) | 0);
+    const amount = opts.jailbreak ? 9 + ((Math.random() * 5) | 0) : 5 + ((Math.random() * 4) | 0);
     code = injectJunk(code, amount);
   }
 
+  // After this point original source structure is gone — only encrypted payload remains
   if (opts.vm) {
     const vmOpts = { minify: opts.minify, jailbreak: opts.jailbreak };
     code = emitHardVm(code, vmOpts);
@@ -433,20 +443,26 @@ function obfuscateLua(input, options = {}) {
       code = emitHardVm(code, vmOpts);
       if (opts.jailbreak) {
         code = emitHardVm(code, { minify: opts.minify, jailbreak: false });
-        stats.mode = "vm-cf-anti-jail-x3";
-      } else stats.mode = "vm-cf-anti-x2";
-    } else stats.mode = "vm-cf-anti";
+        stats.mode = "vm-cf-anti-jail-x3-wiped";
+      } else {
+        stats.mode = "vm-cf-anti-x2-wiped";
+      }
+    } else {
+      stats.mode = "vm-cf-anti-wiped";
+    }
     stats.vm = true;
   } else {
-    code = `--[[ This file was protected by KRPH v${VERSION} ]]\n` + code;
-    stats.mode = opts.jailbreak ? "flat-jail" : "flat";
+    code = `--[[ This file was protected by KRPH v${VERSION} | source-wiped ]]\n` + code;
+    stats.mode = opts.jailbreak ? "flat-jail-wiped" : "flat-wiped";
   }
 
-  if (opts.minify) code = code.replace(/ +/g, " ").replace(/\n{2,}/g, "\n").trim();
+  if (opts.minify) {
+    code = code.replace(/ +/g, " ").replace(/\n{2,}/g, "\n").trim();
+  }
 
+  // Force Luraph-style protection banner (original source deleted)
   if (!code.startsWith("--[[ This file was protected by KRPH")) {
-    const tag = opts.jailbreak ? "jailbreak | do not reverse" : "do not reverse";
-    code = `--[[ This file was protected by KRPH v${VERSION} | ${tag} ]]\n` + code;
+    code = `--[[ This file was protected by KRPH v${VERSION} | original source removed ]]\n` + code;
   }
 
   stats.outputBytes = Buffer.byteLength(code, "utf8");
@@ -454,7 +470,7 @@ function obfuscateLua(input, options = {}) {
 }
 
 const HTML = `<!DOCTYPE html><html lang="ko"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>KRPH v${VERSION}</title>
-<style>:root{--bg:#05070c;--p:#0c1018;--bd:#1a2230;--t:#e8edf7;--m:#8b97ad;--a:#7aa2ff;--a2:#c084fc;--ok:#34d399;--er:#f87171}*{box-sizing:border-box}body{margin:0;font-family:system-ui,sans-serif;background:var(--bg);color:var(--t);min-height:100vh}.bg{position:fixed;inset:0;z-index:-1;background:radial-gradient(800px 400px at 15% -5%,rgba(122,162,255,.15),transparent 55%),var(--bg)}header{display:flex;justify-content:space-between;align-items:center;padding:1rem 1.5rem;border-bottom:1px solid var(--bd)}.logo{font-weight:800;letter-spacing:.12em;background:linear-gradient(90deg,var(--a),var(--a2));-webkit-background-clip:text;background-clip:text;color:transparent}main{max-width:1180px;margin:0 auto;padding:1.25rem}h1{text-align:center;letter-spacing:.14em;font-size:clamp(2rem,5vw,3rem);background:linear-gradient(90deg,var(--a),var(--a2));-webkit-background-clip:text;background-clip:text;color:transparent}.lead{text-align:center;color:var(--m)}.panel{background:var(--p);border:1px solid var(--bd);border-radius:14px;padding:1rem}.tb{display:flex;flex-wrap:wrap;gap:.6rem;justify-content:space-between;margin-bottom:.75rem}label{color:var(--m);font-size:.85rem;margin-right:.6rem;cursor:pointer}button{border:1px solid var(--bd);background:#141a26;color:var(--t);border-radius:8px;padding:.45rem .85rem;cursor:pointer}button.pri{background:linear-gradient(90deg,#3b82f6,#7c3aed);border:0;font-weight:600}.filebtn{display:inline-block;border:1px solid var(--bd);background:#141a26;color:var(--t);border-radius:8px;padding:.45rem .85rem;cursor:pointer;font-size:.85rem}.filebtn input{display:none}.ed{display:grid;grid-template-columns:1fr 1fr;gap:.75rem}@media(max-width:860px){.ed{grid-template-columns:1fr}}.col{border:1px solid var(--bd);border-radius:10px;background:#080b12;display:flex;flex-direction:column}textarea{flex:1;min-height:400px;border:0;resize:vertical;padding:.8rem;background:transparent;color:var(--t);font-family:ui-monospace,monospace;font-size:.8rem}.st{margin-top:.7rem;padding:.55rem .75rem;border-radius:8px;background:rgba(52,211,153,.08);border:1px solid rgba(52,211,153,.25);color:var(--ok);font-family:monospace;font-size:.82rem}.er{margin-top:.7rem;padding:.55rem .75rem;border-radius:8px;background:rgba(248,113,113,.08);border:1px solid rgba(248,113,113,.3);color:var(--er)}</style></head><body><div class="bg"></div><header><div class="logo">KRPH</div><div style="color:var(--m)">v${VERSION} · Lua/Luau</div></header><main><h1>KRPH</h1><p class="lead">Lua + Luau · stream-pool · CF VM · anti-tamper · jailbreak · source wipe</p><section class="panel"><div class="tb"><div>
+<style>:root{--bg:#05070c;--p:#0c1018;--bd:#1a2230;--t:#e8edf7;--m:#8b97ad;--a:#7aa2ff;--a2:#c084fc;--ok:#34d399;--er:#f87171}*{box-sizing:border-box}body{margin:0;font-family:system-ui,sans-serif;background:var(--bg);color:var(--t);min-height:100vh}.bg{position:fixed;inset:0;z-index:-1;background:radial-gradient(800px 400px at 15% -5%,rgba(122,162,255,.15),transparent 55%),var(--bg)}header{display:flex;justify-content:space-between;align-items:center;padding:1rem 1.5rem;border-bottom:1px solid var(--bd)}.logo{font-weight:800;letter-spacing:.12em;background:linear-gradient(90deg,var(--a),var(--a2));-webkit-background-clip:text;background-clip:text;color:transparent}main{max-width:1180px;margin:0 auto;padding:1.25rem}h1{text-align:center;letter-spacing:.14em;font-size:clamp(2rem,5vw,3rem);background:linear-gradient(90deg,var(--a),var(--a2));-webkit-background-clip:text;background-clip:text;color:transparent}.lead{text-align:center;color:var(--m)}.panel{background:var(--p);border:1px solid var(--bd);border-radius:14px;padding:1rem}.tb{display:flex;flex-wrap:wrap;gap:.6rem;justify-content:space-between;margin-bottom:.75rem}label{color:var(--m);font-size:.85rem;margin-right:.6rem;cursor:pointer}button{border:1px solid var(--bd);background:#141a26;color:var(--t);border-radius:8px;padding:.45rem .85rem;cursor:pointer}button.pri{background:linear-gradient(90deg,#3b82f6,#7c3aed);border:0;font-weight:600}.filebtn{display:inline-block;border:1px solid var(--bd);background:#141a26;color:var(--t);border-radius:8px;padding:.45rem .85rem;cursor:pointer;font-size:.85rem}.filebtn input{display:none}.ed{display:grid;grid-template-columns:1fr 1fr;gap:.75rem}@media(max-width:860px){.ed{grid-template-columns:1fr}}.col{border:1px solid var(--bd);border-radius:10px;background:#080b12;display:flex;flex-direction:column}textarea{flex:1;min-height:400px;border:0;resize:vertical;padding:.8rem;background:transparent;color:var(--t);font-family:ui-monospace,monospace;font-size:.8rem}.st{margin-top:.7rem;padding:.55rem .75rem;border-radius:8px;background:rgba(52,211,153,.08);border:1px solid rgba(52,211,153,.25);color:var(--ok);font-family:monospace;font-size:.82rem}.er{margin-top:.7rem;padding:.55rem .75rem;border-radius:8px;background:rgba(248,113,113,.08);border:1px solid rgba(248,113,113,.3);color:var(--er)}</style></head><body><div class="bg"></div><header><div class="logo">KRPH</div><div style="color:var(--m)">v${VERSION} · Lua/Luau</div></header><main><h1>KRPH</h1><p class="lead">original source removed · stream-pool · CF VM · anti-tamper</p><section class="panel"><div class="tb"><div>
 <label><input type="checkbox" id="vm" checked/> VM+CF+anti</label>
 <label><input type="checkbox" id="strings" checked/> string pool</label>
 <label><input type="checkbox" id="rename" checked/> rename</label>
@@ -472,9 +488,7 @@ local count: number = 0
 count += 1
 print(Players.LocalPlayer)
 local msg = "hello KRPH"
-print(msg)</textarea></div><div class="col"><textarea id="out" readonly></textarea></div></div><div class="st" id="stats" hidden></div><div class="er" id="err" hidden></div></section>
-<p style="text-align:center;margin-top:1rem"><a href="/download/krph.js" style="color:#7aa2ff">Download KRPH tool (krph.js)</a></p>
-</main>
+print(msg)</textarea></div><div class="col"><textarea id="out" readonly></textarea></div></div><div class="st" id="stats" hidden></div><div class="er" id="err" hidden></div></section></main>
 <script>
 const $=id=>document.getElementById(id);
 async function run(){
@@ -485,7 +499,7 @@ async function run(){
     if(!res.ok||!d.ok)throw new Error(d.error||"fail");
     $("out").value=d.code;
     $("stats").hidden=false;
-    $("stats").textContent="in "+d.stats.originalBytes+"B -> "+d.stats.outputBytes+"B | "+d.stats.mode+(d.stats.jailbreak?" | jail":"")+(d.stats.wiped?" | wiped":"");
+    $("stats").textContent="in "+d.stats.originalBytes+"B -> "+d.stats.outputBytes+"B | "+d.stats.mode+(d.stats.wiped?" | source removed":"");
   }catch(e){$("err").hidden=false;$("err").textContent=e.message}
   finally{$("go").disabled=false}
 }
@@ -508,16 +522,6 @@ const server = http.createServer(async (req, res) => {
   }
   if (req.method === "GET" && url.pathname === "/api/health") {
     return send(res, 200, JSON.stringify({ ok: true, name: "KRPH", version: VERSION }), "application/json");
-  }
-  if (req.method === "GET" && url.pathname === "/download/krph.js") {
-    const fs = require("fs");
-    const self = fs.readFileSync(__filename);
-    res.writeHead(200, {
-      "Content-Type": "application/javascript; charset=utf-8",
-      "Content-Disposition": `attachment; filename="krph-v${VERSION}.js"`,
-      "Content-Length": self.length
-    });
-    return res.end(self);
   }
   if (req.method === "POST" && url.pathname === "/api/obfuscate") {
     let raw = "";
