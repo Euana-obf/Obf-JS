@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 /**
- * KRPH v2.4 — Lua/Luau obfuscator
- * stream-pool · CF VM · anti-tamper · jailbreak · source wipe
+ * KRPH v2.5 — Lua/Luau obfuscator
+ * Lua / Luau obfuscator
  */
 const http = require("http");
 const { URL } = require("url");
 const crypto = require("crypto");
 const PORT = process.env.PORT || 3000;
-const VERSION = "2.4.0";
+const VERSION = "2.6.0";
 
 const RESERVED = new Set([
   "and","break","do","else","elseif","end","false","for","function","goto","if","in",
@@ -102,6 +102,26 @@ function preprocessLuau(code) {
 }
 
 /** Luraph-style: completely erase original source traces before encryption */
+
+/** LuaObfuscatorV2-style: mutate numeric literals into opaque expressions */
+function mutateNumbers(code) {
+  code = code.replace(/\btrue\b/g, () => Math.random() > 0.5 ? "(1==1)" : "(2>1)");
+  code = code.replace(/\bfalse\b/g, () => Math.random() > 0.5 ? "(1==2)" : "(0>1)");
+  code = code.replace(/\b(\d+)\b/g, (m, n) => {
+    const v = parseInt(n, 10);
+    if (isNaN(v) || v < 0 || v > 500000) return m;
+    if (Math.random() > 0.5) return m;
+    const style = (Math.random() * 5) | 0;
+    if (style === 0) { const a = (Math.random() * 80) | 0; return `(${v + a}-${a})`; }
+    if (style === 1) { const a = (Math.random() * 40) | 0; return `(${v - a}+${a})`; }
+    if (style === 2) return `(${v}*1)`;
+    if (style === 3) { const a = v ^ ((Math.random() * 30) | 0); return `(${a}^${a ^ v})`; }
+    return `(${v}+0)`;
+  });
+  return code;
+}
+
+
 function wipeOriginalSource(code) {
   code = stripComments(code);
   code = preprocessLuau(code);
@@ -334,9 +354,8 @@ function emitHardVm(payloadSrc, opts) {
     `end)(...)`
   ].join(" ");
 
-  const bannerTag = jail ? "CF+anti+jail | source-wiped" : "CF+anti | source-wiped";
   let body = [
-    `--[[ This file was protected by KRPH v${VERSION} | ${bannerTag} ]]`,
+    `--[[ This file was protected by KRPH | krph.onrender.com ]]`,
     BITPOLY, opaque, anti, rebuild, h, driver
   ].join(" ");
 
@@ -452,7 +471,7 @@ function obfuscateLua(input, options = {}) {
     }
     stats.vm = true;
   } else {
-    code = `--[[ This file was protected by KRPH v${VERSION} | source-wiped ]]\n` + code;
+    code = `--[[ This file was protected by KRPH | krph.onrender.com ]]\n` + code;
     stats.mode = opts.jailbreak ? "flat-jail-wiped" : "flat-wiped";
   }
 
@@ -462,7 +481,7 @@ function obfuscateLua(input, options = {}) {
 
   // Force Luraph-style protection banner (original source deleted)
   if (!code.startsWith("--[[ This file was protected by KRPH")) {
-    code = `--[[ This file was protected by KRPH v${VERSION} | original source removed ]]\n` + code;
+    code = `--[[ This file was protected by KRPH | krph.onrender.com ]]\n` + code;
   }
 
   stats.outputBytes = Buffer.byteLength(code, "utf8");
@@ -470,8 +489,8 @@ function obfuscateLua(input, options = {}) {
 }
 
 const HTML = `<!DOCTYPE html><html lang="ko"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>KRPH v${VERSION}</title>
-<style>:root{--bg:#05070c;--p:#0c1018;--bd:#1a2230;--t:#e8edf7;--m:#8b97ad;--a:#7aa2ff;--a2:#c084fc;--ok:#34d399;--er:#f87171}*{box-sizing:border-box}body{margin:0;font-family:system-ui,sans-serif;background:var(--bg);color:var(--t);min-height:100vh}.bg{position:fixed;inset:0;z-index:-1;background:radial-gradient(800px 400px at 15% -5%,rgba(122,162,255,.15),transparent 55%),var(--bg)}header{display:flex;justify-content:space-between;align-items:center;padding:1rem 1.5rem;border-bottom:1px solid var(--bd)}.logo{font-weight:800;letter-spacing:.12em;background:linear-gradient(90deg,var(--a),var(--a2));-webkit-background-clip:text;background-clip:text;color:transparent}main{max-width:1180px;margin:0 auto;padding:1.25rem}h1{text-align:center;letter-spacing:.14em;font-size:clamp(2rem,5vw,3rem);background:linear-gradient(90deg,var(--a),var(--a2));-webkit-background-clip:text;background-clip:text;color:transparent}.lead{text-align:center;color:var(--m)}.panel{background:var(--p);border:1px solid var(--bd);border-radius:14px;padding:1rem}.tb{display:flex;flex-wrap:wrap;gap:.6rem;justify-content:space-between;margin-bottom:.75rem}label{color:var(--m);font-size:.85rem;margin-right:.6rem;cursor:pointer}button{border:1px solid var(--bd);background:#141a26;color:var(--t);border-radius:8px;padding:.45rem .85rem;cursor:pointer}button.pri{background:linear-gradient(90deg,#3b82f6,#7c3aed);border:0;font-weight:600}.filebtn{display:inline-block;border:1px solid var(--bd);background:#141a26;color:var(--t);border-radius:8px;padding:.45rem .85rem;cursor:pointer;font-size:.85rem}.filebtn input{display:none}.ed{display:grid;grid-template-columns:1fr 1fr;gap:.75rem}@media(max-width:860px){.ed{grid-template-columns:1fr}}.col{border:1px solid var(--bd);border-radius:10px;background:#080b12;display:flex;flex-direction:column}textarea{flex:1;min-height:400px;border:0;resize:vertical;padding:.8rem;background:transparent;color:var(--t);font-family:ui-monospace,monospace;font-size:.8rem}.st{margin-top:.7rem;padding:.55rem .75rem;border-radius:8px;background:rgba(52,211,153,.08);border:1px solid rgba(52,211,153,.25);color:var(--ok);font-family:monospace;font-size:.82rem}.er{margin-top:.7rem;padding:.55rem .75rem;border-radius:8px;background:rgba(248,113,113,.08);border:1px solid rgba(248,113,113,.3);color:var(--er)}</style></head><body><div class="bg"></div><header><div class="logo">KRPH</div><div style="color:var(--m)">v${VERSION} · Lua/Luau</div></header><main><h1>KRPH</h1><p class="lead">original source removed · stream-pool · CF VM · anti-tamper</p><section class="panel"><div class="tb"><div>
-<label><input type="checkbox" id="vm" checked/> VM+CF+anti</label>
+<style>:root{--bg:#05070c;--p:#0c1018;--bd:#1a2230;--t:#e8edf7;--m:#8b97ad;--a:#7aa2ff;--a2:#c084fc;--ok:#34d399;--er:#f87171}*{box-sizing:border-box}body{margin:0;font-family:system-ui,sans-serif;background:var(--bg);color:var(--t);min-height:100vh}.bg{position:fixed;inset:0;z-index:-1;background:radial-gradient(800px 400px at 15% -5%,rgba(122,162,255,.15),transparent 55%),var(--bg)}header{display:flex;justify-content:space-between;align-items:center;padding:1rem 1.5rem;border-bottom:1px solid var(--bd)}.logo{font-weight:800;letter-spacing:.12em;background:linear-gradient(90deg,var(--a),var(--a2));-webkit-background-clip:text;background-clip:text;color:transparent}main{max-width:1180px;margin:0 auto;padding:1.25rem}h1{text-align:center;letter-spacing:.14em;font-size:clamp(2rem,5vw,3rem);background:linear-gradient(90deg,var(--a),var(--a2));-webkit-background-clip:text;background-clip:text;color:transparent}.lead{text-align:center;color:var(--m)}.panel{background:var(--p);border:1px solid var(--bd);border-radius:14px;padding:1rem}.tb{display:flex;flex-wrap:wrap;gap:.6rem;justify-content:space-between;margin-bottom:.75rem}label{color:var(--m);font-size:.85rem;margin-right:.6rem;cursor:pointer}button{border:1px solid var(--bd);background:#141a26;color:var(--t);border-radius:8px;padding:.45rem .85rem;cursor:pointer}button.pri{background:linear-gradient(90deg,#3b82f6,#7c3aed);border:0;font-weight:600}.filebtn{display:inline-block;border:1px solid var(--bd);background:#141a26;color:var(--t);border-radius:8px;padding:.45rem .85rem;cursor:pointer;font-size:.85rem}.filebtn input{display:none}.ed{display:grid;grid-template-columns:1fr 1fr;gap:.75rem}@media(max-width:860px){.ed{grid-template-columns:1fr}}.col{border:1px solid var(--bd);border-radius:10px;background:#080b12;display:flex;flex-direction:column}textarea{flex:1;min-height:400px;border:0;resize:vertical;padding:.8rem;background:transparent;color:var(--t);font-family:ui-monospace,monospace;font-size:.8rem}.st{margin-top:.7rem;padding:.55rem .75rem;border-radius:8px;background:rgba(52,211,153,.08);border:1px solid rgba(52,211,153,.25);color:var(--ok);font-family:monospace;font-size:.82rem}.er{margin-top:.7rem;padding:.55rem .75rem;border-radius:8px;background:rgba(248,113,113,.08);border:1px solid rgba(248,113,113,.3);color:var(--er)}</style></head><body><div class="bg"></div><header><div class="logo">KRPH</div><div style="color:var(--m)">v${VERSION} · Lua/Luau</div></header><main><h1>KRPH</h1><p class="lead">Lua / Luau obfuscator</p><section class="panel"><div class="tb"><div>
+<label><input type="checkbox" id="vm" checked/> VM</label>
 <label><input type="checkbox" id="strings" checked/> string pool</label>
 <label><input type="checkbox" id="rename" checked/> rename</label>
 <label><input type="checkbox" id="minify" checked/> minify</label>
