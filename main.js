@@ -121,6 +121,27 @@ async function dbGetScript(id) {
   return fileScripts[id] || null;
 }
 
+async function dbListScripts(ownerHash) {
+  if (useDb) {
+    const r = await pool.query(
+      `SELECT id, created, updated, length(code) AS size
+       FROM krph_scripts WHERE owner_hash=$1 ORDER BY updated DESC`,
+      [ownerHash]
+    );
+    return r.rows;
+  }
+  fileScripts = loadJSON(SCRIPTS_FILE, fileScripts);
+  return Object.keys(fileScripts)
+    .filter((id) => fileScripts[id].ownerHash === ownerHash)
+    .map((id) => ({
+      id,
+      created: fileScripts[id].created,
+      updated: fileScripts[id].updated,
+      size: (fileScripts[id].code || "").length,
+    }))
+    .sort((a, b) => (b.updated || 0) - (a.updated || 0));
+}
+
 async function dbSaveScript(id, ownerHash, code) {
   const now = Date.now();
   if (useDb) {
@@ -533,20 +554,25 @@ nav a{color:#58a6ff;margin-right:14px;text-decoration:none}
 </div>
 
 <div class="card">
-  <h3 style="margin-bottom:8px">2. Save / Update script</h3>
+  <h3 style="margin-bottom:8px">2. My scripts (panel only)</h3>
+  <p class="sub" style="margin:0">Source is only visible here with your owner key. Direct URL without key → You are not Owner.</p>
   <label>Owner key</label>
   <input id="ownerKey" type="text" placeholder="krph_..." autocomplete="off"/>
+  <div class="row">
+    <button type="button" id="btnList">Load my scripts</button>
+  </div>
+  <div id="listBox" class="keybox" style="display:none"></div>
   <label>Script ID (any name, or empty = auto)</label>
   <input id="scriptId" type="text" placeholder="e.g. why"/>
-  <label>Script source</label>
+  <label>Script source (view / edit)</label>
   <textarea id="scriptBody" placeholder='print("a")'></textarea>
-  <div class="row"><button type="button" id="btnSave">Save</button></div>
+  <div class="row"><button type="button" id="btnSave">Save / Update</button></div>
   <div id="saveMsg" class="msg" style="display:none"></div>
 </div>
 
 <div class="card">
   <h3 style="margin-bottom:8px">3. Run (Luarmor style)</h3>
-  <p class="warn">Wrong key → You are not Owner. Only owner can update.</p>
+  <p class="warn">Browser /raw/ID without key → You are not Owner. Executor needs full loadstring with key.</p>
   <div id="linkBox" class="keybox" style="display:none"></div>
 </div>
 </div>
@@ -556,7 +582,9 @@ nav a{color:#58a6ff;margin-right:14px;text-decoration:none}
   const keyBox=document.getElementById('keyBox');
   const saveMsg=document.getElementById('saveMsg');
   const linkBox=document.getElementById('linkBox');
+  const listBox=document.getElementById('listBox');
   function show(el,text,ok){el.style.display='block';el.className='msg '+(ok?'ok':'err');el.textContent=text;}
+  function key(){return document.getElementById('ownerKey').value.trim();}
 
   document.getElementById('btnReg').onclick=async function(){
     const btn=this;btn.disabled=true;
@@ -573,24 +601,60 @@ nav a{color:#58a6ff;margin-right:14px;text-decoration:none}
     btn.disabled=false;
   };
 
+  async function loadList(){
+    const k=key();
+    if(!k){listBox.style.display='block';listBox.textContent='Owner key required';return;}
+    const r=await fetch('/api/myscripts?key='+encodeURIComponent(k));
+    const j=await r.json();
+    if(!r.ok)throw new Error(j.error||'list failed');
+    if(!j.scripts||!j.scripts.length){
+      listBox.style.display='block';
+      listBox.textContent='(no scripts yet)';
+      return;
+    }
+    listBox.style.display='block';
+    listBox.innerHTML=j.scripts.map(function(s){
+      return '<div style="margin:6px 0;cursor:pointer;color:#58a6ff" data-id="'+s.id+'">'+s.id+' · '+s.size+' bytes</div>';
+    }).join('');
+    listBox.querySelectorAll('[data-id]').forEach(function(el){
+      el.onclick=async function(){
+        const id=el.getAttribute('data-id');
+        const r2=await fetch('/api/myscript?id='+encodeURIComponent(id)+'&key='+encodeURIComponent(k));
+        const j2=await r2.json();
+        if(!r2.ok){show(saveMsg,j2.error||'load failed',false);return;}
+        document.getElementById('scriptId').value=j2.id;
+        document.getElementById('scriptBody').value=j2.code;
+        const url=location.origin+'/raw/'+j2.id+'?key='+encodeURIComponent(k);
+        linkBox.style.display='block';
+        linkBox.textContent='loadstring(game:HttpGet("'+url+'"))()';
+        show(saveMsg,'Loaded '+j2.id+' (panel only)',true);
+      };
+    });
+  }
+
+  document.getElementById('btnList').onclick=async function(){
+    try{await loadList();}catch(e){listBox.style.display='block';listBox.textContent=e.message||String(e);}
+  };
+
   document.getElementById('btnSave').onclick=async function(){
-    const key=document.getElementById('ownerKey').value.trim();
+    const k=key();
     const id=document.getElementById('scriptId').value.trim();
     const body=document.getElementById('scriptBody').value;
-    if(!key){show(saveMsg,'Owner key required',false);return;}
+    if(!k){show(saveMsg,'Owner key required',false);return;}
     if(!body){show(saveMsg,'Script empty',false);return;}
     const btn=this;btn.disabled=true;
     saveMsg.style.display='block';saveMsg.className='msg';saveMsg.textContent='Saving...';
     try{
       const r=await fetch('/api/script',{method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({key:key,id:id||undefined,code:body})});
+        body:JSON.stringify({key:k,id:id||undefined,code:body})});
       const j=await r.json();
       if(!r.ok)throw new Error(j.error||'save failed');
       document.getElementById('scriptId').value=j.id;
-      const url=location.origin+'/raw/'+j.id+'?key='+encodeURIComponent(key);
+      const url=location.origin+'/raw/'+j.id+'?key='+encodeURIComponent(k);
       linkBox.style.display='block';
       linkBox.textContent='loadstring(game:HttpGet("'+url+'"))()';
       show(saveMsg,'Saved. ID: '+j.id,true);
+      try{await loadList();}catch(_){}
     }catch(e){show(saveMsg,e.message||String(e),false);}
     btn.disabled=false;
   };
@@ -653,6 +717,28 @@ const server = http.createServer(async (req, res) => {
       const id = genId();
       await dbRegisterUser(hashKey(key), id, ip);
       return json(200, { key, userId: id, db: useDb });
+    }
+
+    // panel: list my scripts (owner key required)
+    if (req.method === "GET" && url.pathname === "/api/myscripts") {
+      const key = (url.searchParams.get("key") || "").trim();
+      if (!key) return json(403, { error: "You are not Owner" });
+      const kh = hashKey(key);
+      if (!(await dbUserExists(kh))) return json(403, { error: "You are not Owner" });
+      const scripts = await dbListScripts(kh);
+      return json(200, { scripts });
+    }
+
+    // panel: get one script source (owner key required)
+    if (req.method === "GET" && url.pathname === "/api/myscript") {
+      const key = (url.searchParams.get("key") || "").trim();
+      const id = (url.searchParams.get("id") || "").trim();
+      if (!key || !id) return json(403, { error: "You are not Owner" });
+      const kh = hashKey(key);
+      if (!(await dbUserExists(kh))) return json(403, { error: "You are not Owner" });
+      const sc = await dbGetScript(id);
+      if (!sc || sc.ownerHash !== kh) return json(403, { error: "You are not Owner" });
+      return json(200, { id: sc.id || id, code: sc.code });
     }
 
     if (req.method === "POST" && url.pathname === "/api/script") {
