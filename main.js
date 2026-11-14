@@ -7,7 +7,7 @@ const http = require("http");
 const { URL } = require("url");
 const crypto = require("crypto");
 const PORT = process.env.PORT || 3000;
-const VERSION = "2.7.0";
+const VERSION = "2.9.0";
 
 const RESERVED = new Set([
   "and","break","do","else","elseif","end","false","for","function","goto","if","in",
@@ -121,6 +121,18 @@ function mutateNumbers(code) {
   return code;
 }
 
+
+
+/** Luraph-style macros (subset) */
+function processMacros(code) {
+  code = code.replace(/\bKRPH_OBFUSCATED\b/g, "true");
+  code = code.replace(/\bLPH_OBFUSCATED\b/g, "true");
+  code = code.replace(/\b(?:KRPH|LPH)_CRASH\s*\(\s*\)/g, '(error("KRPH",0))');
+  code = code.replace(/\b(?:KRPH|LPH)_OPAQUE\s*\(\s*true\s*\)/g, "((1==1) and (2>0))");
+  code = code.replace(/\b(?:KRPH|LPH)_OPAQUE\s*\(\s*false\s*\)/g, "((1==2) or (0>1))");
+  code = code.replace(/^\s*declare\s+.*$/gm, "");
+  return code;
+}
 
 function wipeOriginalSource(code) {
   code = stripComments(code);
@@ -275,7 +287,7 @@ function emitHardVm(payloadSrc, opts) {
     `local function ${run}()`,
     `${probe}();${env}();`,
     jail ? `${antiH}();` : "",
-    `local seed=${seed};local out={};local pos=0;`,
+    `local seed=${seed};do local ek=0;pcall(function()if game and game.PlaceId then ek=tonumber(game.PlaceId)or 0 end end);seed=bit32.bxor(seed,bit32.band(ek,0xffffffff));end;local out={};local pos=0;`,
     `local pools={${poolLit}};`,
     `local real=${realCount};local pi=0;`,
     `for _=1,#pools do`,
@@ -383,17 +395,16 @@ function injectJunk(code, amount = 6) {
 
 function obfuscateLua(input, options = {}) {
   const opts = {
-    strings: options.strings !== false,
-    rename: options.rename !== false,
-    minify: options.minify !== false,
-    stripComments: options.stripComments !== false,
-    vm: options.vm !== false,
-    double: options.double !== false,
-    junk: options.junk !== false,
-    jailbreak: !!options.jailbreak,
-    layers: Math.min(5, Math.max(1, parseInt(options.layers, 10) || (options.jailbreak ? 3 : 2))),
-    // Luraph-style: always wipe original source by default
-    wipe: options.wipe !== false
+    strings: true,
+    rename: true,
+    minify: true,
+    stripComments: true,
+    vm: true,
+    double: true,
+    junk: true,
+    jailbreak: true,
+    wipe: true,
+    layers: 3
   };
 
   let code = String(input || "");
@@ -495,15 +506,7 @@ function obfuscateLua(input, options = {}) {
 }
 
 const HTML = `<!DOCTYPE html><html lang="ko"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>KRPH v${VERSION}</title>
-<style>:root{--bg:#05070c;--p:#0c1018;--bd:#1a2230;--t:#e8edf7;--m:#8b97ad;--a:#7aa2ff;--a2:#c084fc;--ok:#34d399;--er:#f87171}*{box-sizing:border-box}body{margin:0;font-family:system-ui,sans-serif;background:var(--bg);color:var(--t);min-height:100vh}.bg{position:fixed;inset:0;z-index:-1;background:radial-gradient(800px 400px at 15% -5%,rgba(122,162,255,.15),transparent 55%),var(--bg)}header{display:flex;justify-content:space-between;align-items:center;padding:1rem 1.5rem;border-bottom:1px solid var(--bd)}.logo{font-weight:800;letter-spacing:.12em;background:linear-gradient(90deg,var(--a),var(--a2));-webkit-background-clip:text;background-clip:text;color:transparent}main{max-width:1180px;margin:0 auto;padding:1.25rem}h1{text-align:center;letter-spacing:.14em;font-size:clamp(2rem,5vw,3rem);background:linear-gradient(90deg,var(--a),var(--a2));-webkit-background-clip:text;background-clip:text;color:transparent}.lead{text-align:center;color:var(--m)}.panel{background:var(--p);border:1px solid var(--bd);border-radius:14px;padding:1rem}.tb{display:flex;flex-wrap:wrap;gap:.6rem;justify-content:space-between;margin-bottom:.75rem}label{color:var(--m);font-size:.85rem;margin-right:.6rem;cursor:pointer}button{border:1px solid var(--bd);background:#141a26;color:var(--t);border-radius:8px;padding:.45rem .85rem;cursor:pointer}button.pri{background:linear-gradient(90deg,#3b82f6,#7c3aed);border:0;font-weight:600}.filebtn{display:inline-block;border:1px solid var(--bd);background:#141a26;color:var(--t);border-radius:8px;padding:.45rem .85rem;cursor:pointer;font-size:.85rem}.filebtn input{display:none}.ed{display:grid;grid-template-columns:1fr 1fr;gap:.75rem}@media(max-width:860px){.ed{grid-template-columns:1fr}}.col{border:1px solid var(--bd);border-radius:10px;background:#080b12;display:flex;flex-direction:column}textarea{flex:1;min-height:400px;border:0;resize:vertical;padding:.8rem;background:transparent;color:var(--t);font-family:ui-monospace,monospace;font-size:.8rem}.st{margin-top:.7rem;padding:.55rem .75rem;border-radius:8px;background:rgba(52,211,153,.08);border:1px solid rgba(52,211,153,.25);color:var(--ok);font-family:monospace;font-size:.82rem}.er{margin-top:.7rem;padding:.55rem .75rem;border-radius:8px;background:rgba(248,113,113,.08);border:1px solid rgba(248,113,113,.3);color:var(--er)}</style></head><body><div class="bg"></div><header><div class="logo">KRPH</div><div style="color:var(--m)">v${VERSION} · Lua/Luau</div></header><main><h1>KRPH</h1><p class="lead">Lua / Luau obfuscator</p><section class="panel"><div class="tb"><div>
-<label><input type="checkbox" id="vm" checked/> VM</label>
-<label><input type="checkbox" id="strings" checked/> string pool</label>
-<label><input type="checkbox" id="rename" checked/> rename</label>
-<label><input type="checkbox" id="minify" checked/> minify</label>
-<label><input type="checkbox" id="wipe" checked/> wipe source</label>
-<label><input type="checkbox" id="jailbreak"/> jailbreak</label>
-<label>layers <select id="layers"><option value="1">1</option><option value="2" selected>2</option><option value="3">3</option><option value="4">4</option><option value="5">5</option></select></label>
-</div><div>
+<style>:root{--bg:#05070c;--p:#0c1018;--bd:#1a2230;--t:#e8edf7;--m:#8b97ad;--a:#7aa2ff;--a2:#c084fc;--ok:#34d399;--er:#f87171}*{box-sizing:border-box}body{margin:0;font-family:system-ui,sans-serif;background:var(--bg);color:var(--t);min-height:100vh}.bg{position:fixed;inset:0;z-index:-1;background:radial-gradient(800px 400px at 15% -5%,rgba(122,162,255,.15),transparent 55%),var(--bg)}header{display:flex;justify-content:space-between;align-items:center;padding:1rem 1.5rem;border-bottom:1px solid var(--bd)}.logo{font-weight:800;letter-spacing:.12em;background:linear-gradient(90deg,var(--a),var(--a2));-webkit-background-clip:text;background-clip:text;color:transparent}main{max-width:1180px;margin:0 auto;padding:1.25rem}h1{text-align:center;letter-spacing:.14em;font-size:clamp(2rem,5vw,3rem);background:linear-gradient(90deg,var(--a),var(--a2));-webkit-background-clip:text;background-clip:text;color:transparent}.lead{text-align:center;color:var(--m)}.panel{background:var(--p);border:1px solid var(--bd);border-radius:14px;padding:1rem}.tb{display:flex;flex-wrap:wrap;gap:.6rem;justify-content:space-between;margin-bottom:.75rem}label{color:var(--m);font-size:.85rem;margin-right:.6rem;cursor:pointer}button{border:1px solid var(--bd);background:#141a26;color:var(--t);border-radius:8px;padding:.45rem .85rem;cursor:pointer}button.pri{background:linear-gradient(90deg,#3b82f6,#7c3aed);border:0;font-weight:600}.filebtn{display:inline-block;border:1px solid var(--bd);background:#141a26;color:var(--t);border-radius:8px;padding:.45rem .85rem;cursor:pointer;font-size:.85rem}.filebtn input{display:none}.ed{display:grid;grid-template-columns:1fr 1fr;gap:.75rem}@media(max-width:860px){.ed{grid-template-columns:1fr}}.col{border:1px solid var(--bd);border-radius:10px;background:#080b12;display:flex;flex-direction:column}textarea{flex:1;min-height:400px;border:0;resize:vertical;padding:.8rem;background:transparent;color:var(--t);font-family:ui-monospace,monospace;font-size:.8rem}.st{margin-top:.7rem;padding:.55rem .75rem;border-radius:8px;background:rgba(52,211,153,.08);border:1px solid rgba(52,211,153,.25);color:var(--ok);font-family:monospace;font-size:.82rem}.er{margin-top:.7rem;padding:.55rem .75rem;border-radius:8px;background:rgba(248,113,113,.08);border:1px solid rgba(248,113,113,.3);color:var(--er)}</style></head><body><div class="bg"></div><header><div class="logo">KRPH</div><div style="color:var(--m)">v${VERSION} · Lua/Luau</div></header><main><h1>KRPH</h1><p class="lead">Lua / Luau obfuscator</p><section class="panel"><div class="tb"><div style="color:var(--m);font-size:.85rem">full protect · 3-layer VM · wipe · anti</div><div>
 <button class="pri" id="go">Obfuscate</button>
 <button id="copy">Copy</button>
 <label class="filebtn">Upload .lua/.luau<input type="file" id="up" accept=".lua,.luau,.txt,text/plain"/></label>
@@ -520,7 +523,7 @@ const $=id=>document.getElementById(id);
 async function run(){
   $("err").hidden=true;$("stats").hidden=true;$("go").disabled=true;
   try{
-    const res=await fetch("/api/obfuscate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({code:$("in").value,options:{vm:$("vm").checked,strings:$("strings").checked,rename:$("rename").checked,minify:$("minify").checked,wipe:$("wipe").checked,jailbreak:$("jailbreak").checked,layers:parseInt($("layers").value,10)||2}})});
+    const res=await fetch("/api/obfuscate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({code:$("in").value})});
     const d=await res.json();
     if(!res.ok||!d.ok)throw new Error(d.error||"fail");
     $("out").value=d.code;
@@ -560,7 +563,7 @@ const server = http.createServer(async (req, res) => {
       if (typeof body.code !== "string" || !body.code.trim()) {
         return send(res, 400, JSON.stringify({ error: "code required" }), "application/json");
       }
-      const result = obfuscateLua(body.code, body.options || {});
+      const result = obfuscateLua(body.code, {}); // always full protect
       return send(res, 200, JSON.stringify({ ok: true, code: result.code, stats: result.stats }), "application/json");
     } catch (e) {
       return send(res, 500, JSON.stringify({ error: e.message || "fail" }), "application/json");
