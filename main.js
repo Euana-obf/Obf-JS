@@ -6,8 +6,27 @@
 const http = require("http");
 const { URL } = require("url");
 const crypto = require("crypto");
+const fs = require("fs");
 const PORT = process.env.PORT || 3000;
-const VERSION = "3.1.0";
+const VERSION = "3.2.0";
+
+const path = require("path");
+const DATA_DIR = process.env.KRPH_DATA || path.join(__dirname, "krph_data");
+try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch {}
+const OWNERS_FILE = path.join(DATA_DIR, "owners.json");
+const SCRIPTS_DIR = path.join(DATA_DIR, "scripts");
+try { fs.mkdirSync(SCRIPTS_DIR, { recursive: true }); } catch {}
+
+function loadOwners() {
+  try { return JSON.parse(fs.readFileSync(OWNERS_FILE, "utf8")); } catch { return {}; }
+}
+function saveOwners(o) {
+  fs.writeFileSync(OWNERS_FILE, JSON.stringify(o, null, 0));
+}
+function newId() { return crypto.randomBytes(12).toString("hex"); }
+function newKey() { return "krph_" + crypto.randomBytes(24).toString("hex"); }
+
+
 
 const RESERVED = new Set([
   "and","break","do","else","elseif","end","false","for","function","goto","if","in",
@@ -522,6 +541,68 @@ function obfuscateLua(input, options = {}) {
   return { code, stats };
 }
 
+
+const PRO_HTML = `<!DOCTYPE html><html lang="ko"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>KRPH Pro</title>
+<style>
+:root{--bg:#05070c;--p:#0c1018;--bd:#1a2230;--t:#e8edf7;--m:#8b97ad;--a:#7aa2ff;--er:#f87171;--ok:#34d399}
+*{box-sizing:border-box}body{margin:0;font-family:system-ui,sans-serif;background:var(--bg);color:var(--t);min-height:100vh}
+header{padding:1rem 1.5rem;border-bottom:1px solid var(--bd);display:flex;justify-content:space-between;align-items:center}
+.logo{font-weight:800;letter-spacing:.12em;background:linear-gradient(90deg,var(--a),#c084fc);-webkit-background-clip:text;background-clip:text;color:transparent}
+main{max-width:720px;margin:0 auto;padding:1.5rem}
+.panel{background:var(--p);border:1px solid var(--bd);border-radius:14px;padding:1.25rem;margin-bottom:1rem}
+h1{font-size:1.4rem;margin:0 0 .5rem}p{color:var(--m);font-size:.9rem}
+input,textarea{width:100%;background:#080b12;border:1px solid var(--bd);border-radius:8px;color:var(--t);padding:.6rem .75rem;font-family:ui-monospace,monospace;font-size:.85rem;margin:.4rem 0}
+textarea{min-height:180px;resize:vertical}
+button{border:0;background:linear-gradient(90deg,#3b82f6,#7c3aed);color:#fff;border-radius:8px;padding:.55rem 1rem;cursor:pointer;font-weight:600;margin-top:.4rem;margin-right:.4rem}
+.msg{margin-top:.75rem;padding:.55rem .75rem;border-radius:8px;font-family:monospace;font-size:.82rem;word-break:break-all}
+.ok{background:rgba(52,211,153,.08);border:1px solid rgba(52,211,153,.25);color:var(--ok)}
+.er{background:rgba(248,113,113,.08);border:1px solid rgba(248,113,113,.3);color:var(--er)}
+a{color:var(--a)}
+</style></head><body>
+<header><div class="logo">KRPH PRO</div><a href="/" style="color:var(--m);text-decoration:none">obfuscator</a></header>
+<main>
+<section class="panel">
+<h1>1. Owner key</h1>
+<p>Register to get an owner key. Only this key can open your raw links.</p>
+<button id="reg">Register</button>
+<div class="msg ok" id="regOut" hidden></div>
+</section>
+<section class="panel">
+<h1>2. Save script</h1>
+<p>Save protected script and get a raw link.</p>
+<input id="key" placeholder="owner key (krph_...)" />
+<textarea id="code" placeholder="-- obfuscated lua here"></textarea>
+<button id="save">Save & get raw link</button>
+<div class="msg ok" id="saveOut" hidden></div>
+<div class="msg er" id="err" hidden></div>
+</section>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+$("reg").onclick=async()=>{
+  $("err").hidden=true;
+  const r=await fetch("/api/register",{method:"POST"});
+  const d=await r.json();
+  if(!d.ok){$("err").hidden=false;$("err").textContent=d.error||"fail";return;}
+  $("regOut").hidden=false;
+  $("regOut").textContent="OWNER KEY (save this): "+d.key;
+  $("key").value=d.key;
+  try{localStorage.setItem("krph_owner",d.key)}catch{}
+};
+try{const k=localStorage.getItem("krph_owner");if(k)$("key").value=k}catch{}
+$("save").onclick=async()=>{
+  $("err").hidden=true;$("saveOut").hidden=true;
+  const key=$("key").value.trim(), code=$("code").value;
+  if(!key||!code.trim()){$("err").hidden=false;$("err").textContent="key and code required";return;}
+  const r=await fetch("/api/pro/save",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({key,code})});
+  const d=await r.json();
+  if(!d.ok){$("err").hidden=false;$("err").textContent=d.error||"fail";return;}
+  $("saveOut").hidden=false;
+  $("saveOut").innerHTML="raw: <a href=\""+d.rawUrl+"\" target="_blank">"+d.rawUrl+"</a><br/>id: "+d.id;
+};
+</script>
+</body></html>`;
+
 const HTML = `<!DOCTYPE html><html lang="ko"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>KRPH v${VERSION}</title>
 <style>:root{--bg:#05070c;--p:#0c1018;--bd:#1a2230;--t:#e8edf7;--m:#8b97ad;--a:#7aa2ff;--a2:#c084fc;--ok:#34d399;--er:#f87171}*{box-sizing:border-box}body{margin:0;font-family:system-ui,sans-serif;background:var(--bg);color:var(--t);min-height:100vh}.bg{position:fixed;inset:0;z-index:-1;background:radial-gradient(800px 400px at 15% -5%,rgba(122,162,255,.15),transparent 55%),var(--bg)}header{display:flex;justify-content:space-between;align-items:center;padding:1rem 1.5rem;border-bottom:1px solid var(--bd)}.logo{font-weight:800;letter-spacing:.12em;background:linear-gradient(90deg,var(--a),var(--a2));-webkit-background-clip:text;background-clip:text;color:transparent}main{max-width:1180px;margin:0 auto;padding:1.25rem}h1{text-align:center;letter-spacing:.14em;font-size:clamp(2rem,5vw,3rem);background:linear-gradient(90deg,var(--a),var(--a2));-webkit-background-clip:text;background-clip:text;color:transparent}.lead{text-align:center;color:var(--m)}.panel{background:var(--p);border:1px solid var(--bd);border-radius:14px;padding:1rem}.tb{display:flex;flex-wrap:wrap;gap:.6rem;justify-content:space-between;margin-bottom:.75rem}label{color:var(--m);font-size:.85rem;margin-right:.6rem;cursor:pointer}button{border:1px solid var(--bd);background:#141a26;color:var(--t);border-radius:8px;padding:.45rem .85rem;cursor:pointer}button.pri{background:linear-gradient(90deg,#3b82f6,#7c3aed);border:0;font-weight:600}.filebtn{display:inline-block;border:1px solid var(--bd);background:#141a26;color:var(--t);border-radius:8px;padding:.45rem .85rem;cursor:pointer;font-size:.85rem}.filebtn input{display:none}.ed{display:grid;grid-template-columns:1fr 1fr;gap:.75rem}@media(max-width:860px){.ed{grid-template-columns:1fr}}.col{border:1px solid var(--bd);border-radius:10px;background:#080b12;display:flex;flex-direction:column}textarea{flex:1;min-height:400px;border:0;resize:vertical;padding:.8rem;background:transparent;color:var(--t);font-family:ui-monospace,monospace;font-size:.8rem}.st{margin-top:.7rem;padding:.55rem .75rem;border-radius:8px;background:rgba(52,211,153,.08);border:1px solid rgba(52,211,153,.25);color:var(--ok);font-family:monospace;font-size:.82rem}.er{margin-top:.7rem;padding:.55rem .75rem;border-radius:8px;background:rgba(248,113,113,.08);border:1px solid rgba(248,113,113,.3);color:var(--er)}</style></head><body><div class="bg"></div><header><div class="logo">KRPH</div><div style="color:var(--m)">v${VERSION} · Lua/Luau</div></header><main><h1>KRPH</h1><p class="lead">Lua / Luau obfuscator</p><section class="panel"><div class="tb"><div style="color:var(--m);font-size:.85rem">full protect · 3-layer VM · wipe · anti</div><div>
 <button class="pri" id="go">Obfuscate</button>
@@ -586,6 +667,66 @@ const server = http.createServer(async (req, res) => {
       return send(res, 500, JSON.stringify({ error: e.message || "fail" }), "application/json");
     }
   }
+
+  if (req.method === "GET" && url.pathname === "/pro") {
+    return send(res, 200, PRO_HTML, "text/html; charset=utf-8");
+  }
+  if (req.method === "POST" && url.pathname === "/api/register") {
+    const owners = loadOwners();
+    const key = newKey();
+    owners[key] = { created: Date.now(), scripts: [] };
+    saveOwners(owners);
+    return send(res, 200, JSON.stringify({ ok: true, key }), "application/json");
+  }
+  if (req.method === "POST" && url.pathname === "/api/pro/save") {
+    let raw = "";
+    for await (const ch of req) {
+      raw += ch;
+      if (raw.length > 3000000) return send(res, 413, JSON.stringify({ error: "too large" }), "application/json");
+    }
+    try {
+      const body = JSON.parse(raw || "{}");
+      const key = String(body.key || "");
+      const code = String(body.code || "");
+      if (!key || !code.trim()) return send(res, 400, JSON.stringify({ error: "key and code required" }), "application/json");
+      const owners = loadOwners();
+      if (!owners[key]) return send(res, 403, JSON.stringify({ error: "You are not Owner" }), "application/json");
+      const id = newId();
+      const meta = { id, owner: key, created: Date.now() };
+      fs.writeFileSync(path.join(SCRIPTS_DIR, id + ".lua"), code);
+      fs.writeFileSync(path.join(SCRIPTS_DIR, id + ".json"), JSON.stringify(meta));
+      owners[key].scripts = owners[key].scripts || [];
+      owners[key].scripts.push(id);
+      saveOwners(owners);
+      const host = req.headers.host || ("localhost:" + PORT);
+      const proto = (req.headers["x-forwarded-proto"] || "http");
+      const rawUrl = proto + "://" + host + "/raw/" + id + "?key=" + encodeURIComponent(key);
+      return send(res, 200, JSON.stringify({ ok: true, id, rawUrl }), "application/json");
+    } catch (e) {
+      return send(res, 500, JSON.stringify({ error: e.message || "fail" }), "application/json");
+    }
+  }
+  if (req.method === "GET" && url.pathname.startsWith("/raw/")) {
+    const id = url.pathname.slice(5).replace(/[^a-f0-9]/gi, "");
+    const key = url.searchParams.get("key") || "";
+    if (!id) return send(res, 404, "not found");
+    const metaPath = path.join(SCRIPTS_DIR, id + ".json");
+    const luaPath = path.join(SCRIPTS_DIR, id + ".lua");
+    if (!fs.existsSync(metaPath) || !fs.existsSync(luaPath)) return send(res, 404, "not found");
+    let meta;
+    try { meta = JSON.parse(fs.readFileSync(metaPath, "utf8")); } catch { return send(res, 404, "not found"); }
+    if (!key || key !== meta.owner) {
+      return send(res, 403, "You are not Owner", "text/plain; charset=utf-8");
+    }
+    const code = fs.readFileSync(luaPath, "utf8");
+    res.writeHead(200, {
+      "Content-Type": "text/plain; charset=utf-8",
+      "Content-Disposition": "inline; filename=\"" + id + ".lua\"",
+      "Cache-Control": "no-store"
+    });
+    return res.end(code);
+  }
+
   send(res, 404, "not found");
 });
 
