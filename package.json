@@ -1,0 +1,15 @@
+{
+  "name": "krph",
+  "version": "3.3.0",
+  "description": "KRPH Lua/Luau obfuscator + Pro loader",
+  "main": "main.js",
+  "scripts": {
+    "start": "node main.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "pg": "^8.13.1"
+  }
+}

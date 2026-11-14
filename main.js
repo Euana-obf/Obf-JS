@@ -1,6 +1,7 @@
 /**
- * KRPH v3.2 | krph.onrender.com
- * Roblox Luau / Lua obfuscator + Pro (owner-key, raw links, blacklist)
+ * KRPH v3.3 | krph.onrender.com
+ * Lua/Luau obfuscator + Pro (owner-key, raw loaders)
+ * Storage: Postgres (DATABASE_URL) or local JSON fallback
  */
 const http = require("http");
 const fs = require("fs");
@@ -9,6 +10,7 @@ const crypto = require("crypto");
 const { URL } = require("url");
 
 const PORT = process.env.PORT || 3000;
+const DATABASE_URL = process.env.DATABASE_URL || "";
 const DATA_DIR = process.env.KRPH_DATA || path.join(__dirname, "krph_data");
 const USERS_FILE = path.join(DATA_DIR, "users.json");
 const SCRIPTS_FILE = path.join(DATA_DIR, "scripts.json");
@@ -26,10 +28,6 @@ function saveJSON(file, data) {
   fs.writeFileSync(file, JSON.stringify(data, null, 2));
 }
 
-let users = loadJSON(USERS_FILE, {});
-let scripts = loadJSON(SCRIPTS_FILE, {});
-let blacklist = loadJSON(BLACKLIST_FILE, { ips: [], keys: [] });
-
 function genKey() {
   return "krph_" + crypto.randomBytes(16).toString("hex");
 }
@@ -37,10 +35,176 @@ function genId() {
   return crypto.randomBytes(8).toString("hex");
 }
 function hashKey(k) {
-  return crypto.createHash("sha256").update(k).digest("hex");
+  return crypto.createHash("sha256").update(String(k)).digest("hex");
 }
 
-/* ===================== OBFUSCATOR CORE (always-on) ===================== */
+/* ===================== DATABASE LAYER ===================== */
+let pool = null;
+let useDb = false;
+
+// file fallback memory
+let fileUsers = loadJSON(USERS_FILE, {});
+let fileScripts = loadJSON(SCRIPTS_FILE, {});
+let fileBlacklist = loadJSON(BLACKLIST_FILE, { ips: [], keys: [] });
+
+async function initDb() {
+  if (!DATABASE_URL) {
+    console.log("[KRPH] No DATABASE_URL — using local JSON files (ephemeral on Render)");
+    return;
+  }
+  try {
+    const { Pool } = require("pg");
+    pool = new Pool({
+      connectionString: DATABASE_URL,
+      ssl: DATABASE_URL.includes("localhost") ? false : { rejectUnauthorized: false },
+    });
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS krph_users (
+        key_hash TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        created BIGINT NOT NULL,
+        ip TEXT
+      );
+      CREATE TABLE IF NOT EXISTS krph_scripts (
+        id TEXT PRIMARY KEY,
+        owner_hash TEXT NOT NULL,
+        code TEXT NOT NULL,
+        created BIGINT NOT NULL,
+        updated BIGINT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS krph_blacklist (
+        kind TEXT NOT NULL,
+        value TEXT NOT NULL,
+        PRIMARY KEY (kind, value)
+      );
+    `);
+    useDb = true;
+    console.log("[KRPH] Postgres connected");
+  } catch (e) {
+    console.error("[KRPH] DB init failed, falling back to files:", e.message);
+    useDb = false;
+    pool = null;
+  }
+}
+
+async function dbRegisterUser(keyHash, userId, ip) {
+  if (useDb) {
+    await pool.query(
+      `INSERT INTO krph_users (key_hash, user_id, created, ip) VALUES ($1,$2,$3,$4)
+       ON CONFLICT (key_hash) DO NOTHING`,
+      [keyHash, userId, Date.now(), ip || ""]
+    );
+    return;
+  }
+  fileUsers[keyHash] = { id: userId, created: Date.now(), ip: ip || "" };
+  saveJSON(USERS_FILE, fileUsers);
+}
+
+async function dbUserExists(keyHash) {
+  if (useDb) {
+    const r = await pool.query(`SELECT 1 FROM krph_users WHERE key_hash=$1`, [keyHash]);
+    return r.rowCount > 0;
+  }
+  fileUsers = loadJSON(USERS_FILE, fileUsers);
+  return !!fileUsers[keyHash];
+}
+
+async function dbGetScript(id) {
+  if (useDb) {
+    const r = await pool.query(
+      `SELECT id, owner_hash AS "ownerHash", code, created, updated FROM krph_scripts WHERE id=$1`,
+      [id]
+    );
+    return r.rows[0] || null;
+  }
+  fileScripts = loadJSON(SCRIPTS_FILE, fileScripts);
+  return fileScripts[id] || null;
+}
+
+async function dbSaveScript(id, ownerHash, code) {
+  const now = Date.now();
+  if (useDb) {
+    await pool.query(
+      `INSERT INTO krph_scripts (id, owner_hash, code, created, updated)
+       VALUES ($1,$2,$3,$4,$5)
+       ON CONFLICT (id) DO UPDATE SET code=EXCLUDED.code, updated=EXCLUDED.updated
+       WHERE krph_scripts.owner_hash=EXCLUDED.owner_hash`,
+      [id, ownerHash, code, now, now]
+    );
+    return;
+  }
+  fileScripts = loadJSON(SCRIPTS_FILE, fileScripts);
+  if (fileScripts[id]) {
+    fileScripts[id].code = code;
+    fileScripts[id].updated = now;
+  } else {
+    fileScripts[id] = { ownerHash, code, created: now, updated: now };
+  }
+  saveJSON(SCRIPTS_FILE, fileScripts);
+}
+
+async function dbIsBlacklisted(ip, key) {
+  if (useDb) {
+    if (ip) {
+      const r = await pool.query(
+        `SELECT 1 FROM krph_blacklist WHERE kind='ip' AND value=$1`,
+        [ip]
+      );
+      if (r.rowCount) return true;
+    }
+    if (key) {
+      const r = await pool.query(
+        `SELECT 1 FROM krph_blacklist WHERE kind='key' AND value=$1`,
+        [hashKey(key)]
+      );
+      if (r.rowCount) return true;
+    }
+    return false;
+  }
+  fileBlacklist = loadJSON(BLACKLIST_FILE, fileBlacklist);
+  if (ip && fileBlacklist.ips.includes(ip)) return true;
+  if (key && fileBlacklist.keys.includes(hashKey(key))) return true;
+  return false;
+}
+
+async function dbAddBlacklist(ip, key, reason) {
+  console.log("[BLACKLIST]", reason, ip || "", key ? String(key).slice(0, 12) + "..." : "");
+  if (useDb) {
+    if (ip) {
+      await pool.query(
+        `INSERT INTO krph_blacklist (kind, value) VALUES ('ip',$1) ON CONFLICT DO NOTHING`,
+        [ip]
+      );
+    }
+    if (key) {
+      await pool.query(
+        `INSERT INTO krph_blacklist (kind, value) VALUES ('key',$1) ON CONFLICT DO NOTHING`,
+        [hashKey(key)]
+      );
+    }
+    return;
+  }
+  fileBlacklist = loadJSON(BLACKLIST_FILE, fileBlacklist);
+  if (ip && !fileBlacklist.ips.includes(ip)) fileBlacklist.ips.push(ip);
+  if (key) {
+    const h = hashKey(key);
+    if (!fileBlacklist.keys.includes(h)) fileBlacklist.keys.push(h);
+  }
+  saveJSON(BLACKLIST_FILE, fileBlacklist);
+}
+
+async function dbClearIpBlacklist(ip) {
+  if (!ip) return;
+  if (useDb) {
+    await pool.query(`DELETE FROM krph_blacklist WHERE kind='ip' AND value=$1`, [ip]);
+    return;
+  }
+  fileBlacklist = loadJSON(BLACKLIST_FILE, fileBlacklist);
+  fileBlacklist.ips = fileBlacklist.ips.filter((x) => x !== ip);
+  saveJSON(BLACKLIST_FILE, fileBlacklist);
+}
+
+/* ===================== OBFUSCATOR CORE ===================== */
 function wipeSource(src) {
   src = src.replace(/--\[(=*)\[[\s\S]*?\]\1\]/g, "");
   src = src.replace(/--[^\n]*/g, "");
@@ -92,34 +256,6 @@ function xorshift32(seed) {
   };
 }
 
-function encryptString(str, seed) {
-  const bytes = Buffer.from(str, "utf8");
-  const next = xorshift32(seed);
-  const out = [];
-  for (let i = 0; i < bytes.length; i++) {
-    out.push(bytes[i] ^ (next() & 0xff));
-  }
-  return out;
-}
-
-function extractAndEncryptStrings(src) {
-  const pool = [];
-  const seeds = [];
-  let idx = 0;
-  src = src.replace(/(["'])(?:(?!\1|\\).|\\.)*\1/g, (m) => {
-    if (m.length < 3) return m;
-    const inner = m.slice(1, -1);
-    const seed = (Math.random() * 0x7fffffff) >>> 0;
-    const enc = encryptString(inner, seed);
-    pool.push(enc);
-    seeds.push(seed);
-    const ref = `__S${idx}__`;
-    idx++;
-    return ref;
-  });
-  return { src, pool, seeds };
-}
-
 function randomName() {
   const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
   let s = chars[Math.floor(Math.random() * 52)];
@@ -129,7 +265,7 @@ function randomName() {
   return s;
 }
 
-function emitHardVm(payloadSrc, layer) {
+function emitHardVm(payloadSrc) {
   const seed = (Math.random() * 0x7fffffff) >>> 0;
   const bytes = Buffer.from(payloadSrc, "utf8");
   const next = xorshift32(seed);
@@ -157,17 +293,13 @@ function emitHardVm(payloadSrc, layer) {
     const j = Math.floor(Math.random() * (i + 1));
     [chunks[i], chunks[j]] = [chunks[j], chunks[i]];
   }
-  let realIdx = 0;
+
   const order = [];
+  let realIdx = 0;
   for (let i = 0; i < chunks.length; i++) {
-    const isReal = realIdx < realCount && Math.random() > 0.35;
-    if (isReal || realIdx >= realCount) {
-      if (realIdx < realCount) {
-        order.push({ t: "r", c: chunks[i] });
-        realIdx++;
-      } else {
-        order.push({ t: "d", c: chunks[i] });
-      }
+    if (realIdx < realCount && (i % 2 === 0 || realIdx + (chunks.length - i) <= realCount)) {
+      order.push({ t: "r", c: chunks[i] });
+      realIdx++;
     } else {
       order.push({ t: "d", c: chunks[i] });
     }
@@ -201,10 +333,7 @@ function emitHardVm(payloadSrc, layer) {
     stateIds[s] = 20000 + Math.floor(Math.random() * 90000);
   });
 
-  const poolLit = order
-    .map((o) => `{${o.c.join(",")}}`)
-    .join(",");
-
+  const poolLit = order.map((o) => `{${o.c.join(",")}}`).join(",");
   const realOrder = order.map((o) => (o.t === "r" ? 1 : 0)).join(",");
 
   return `--[[ This file was protected by KRPH | krph.onrender.com ]]
@@ -240,7 +369,7 @@ ${n.hook}()
 local sd=${n.seedN}
 if game and game.PlaceId then sd=${n.bit}.bxor(sd,game.PlaceId%2147483647)end
 local function xs(s)s=${n.bit}.bxor(s,${n.bit}.lshift(s,13))s=${n.bit}.bxor(s,${n.bit}.rshift(s,17))s=${n.bit}.bxor(s,${n.bit}.lshift(s,5))return s%4294967296 end
-local buf,sum,ri={},0,0
+local buf,sum={},0
 for i=1,#${n.pools} do
 if ${n.real}[i]==1 then
 local ch=${n.pools}[i]
@@ -250,7 +379,6 @@ local c=ch[j]
 sum=(sum+c)%65536
 buf[#buf+1]=${n.seal}.c(${n.bit}.bxor(c,sd%256))
 end
-ri=ri+1
 end
 end
 if sum~=${n.expect}then ${n.die}("INT")end
@@ -296,19 +424,12 @@ function obfuscate(src) {
   code = wipeSource(code);
   code = processMacros(code);
   code = transformConstants(code);
-  const { src: withRefs, pool, seeds } = extractAndEncryptStrings(code);
-  // simple rename of local-looking ids (safe subset)
-  let body = withRefs;
-  // rebuild string refs at runtime would need more; for stability keep refs as-is and embed pool decode later if needed
-  // For now final body goes through 3-layer VM
-  let out = body;
-  for (let i = 0; i < 3; i++) {
-    out = emitHardVm(out, i + 1);
-  }
+  let out = code;
+  for (let i = 0; i < 3; i++) out = emitHardVm(out);
   return out;
 }
 
-/* ===================== HTTP SERVER ===================== */
+/* ===================== HTML ===================== */
 const MAIN_HTML = `<!DOCTYPE html>
 <html lang="ko">
 <head>
@@ -327,21 +448,15 @@ button{background:#238636;color:#fff;border:0;border-radius:8px;padding:10px 18p
 button:hover{background:#2ea043}
 button.secondary{background:#21262d}
 button.secondary:hover{background:#30363d}
-.out{margin-top:16px}
 .msg{margin-top:10px;padding:10px;border-radius:6px;font-size:.9rem}
 .ok{background:#12261e;color:#3fb950}
 .err{background:#2d1214;color:#f85149}
-a{color:#58a6ff}
-nav{margin-bottom:18px}
-nav a{margin-right:14px;text-decoration:none}
+nav a{margin-right:14px;text-decoration:none;color:#58a6ff}
 </style>
 </head>
 <body>
 <div class="wrap">
-<nav>
-  <a href="/">Obfuscator</a>
-  <a href="/pro">Pro</a>
-</nav>
+<nav><a href="/">Obfuscator</a><a href="/pro">Pro</a></nav>
 <h1>KRPH</h1>
 <p class="sub">Lua / Luau · 3-layer VM · wipe · anti-hook · krph.onrender.com</p>
 <textarea id="src" placeholder="Paste Lua / Luau source..."></textarea>
@@ -349,21 +464,15 @@ nav a{margin-right:14px;text-decoration:none}
   <button id="btnObf">Obfuscate</button>
   <button id="btnDl" class="secondary" disabled>Download .lua</button>
 </div>
-<div class="out">
-  <textarea id="dst" readonly placeholder="Protected output..."></textarea>
-  <div id="msg"></div>
-</div>
+<textarea id="dst" readonly placeholder="Protected output..."></textarea>
+<div id="msg"></div>
 </div>
 <script>
-const src=document.getElementById('src');
-const dst=document.getElementById('dst');
-const msg=document.getElementById('msg');
-const btnObf=document.getElementById('btnObf');
-const btnDl=document.getElementById('btnDl');
+const src=document.getElementById('src'),dst=document.getElementById('dst'),msg=document.getElementById('msg');
+const btnObf=document.getElementById('btnObf'),btnDl=document.getElementById('btnDl');
 let last='';
 btnObf.onclick=async()=>{
-  msg.className='msg';msg.textContent='Working...';
-  btnObf.disabled=true;
+  msg.className='msg';msg.textContent='Working...';btnObf.disabled=true;
   try{
     const r=await fetch('/api/obfuscate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code:src.value})});
     const j=await r.json();
@@ -401,8 +510,6 @@ textarea{min-height:160px;font-family:ui-monospace,monospace;font-size:13px}
 .row{display:flex;gap:10px;margin-top:14px;flex-wrap:wrap}
 button{background:#238636;color:#fff;border:0;border-radius:8px;padding:10px 18px;font-weight:600;cursor:pointer}
 button:hover{background:#2ea043}
-button.secondary{background:#21262d}
-button.secondary:hover{background:#30363d}
 .card{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:16px;margin-bottom:16px}
 .msg{margin-top:12px;padding:10px;border-radius:6px;font-size:.9rem;white-space:pre-wrap}
 .ok{background:#12261e;color:#3fb950}
@@ -414,19 +521,13 @@ nav a{color:#58a6ff;margin-right:14px;text-decoration:none}
 </head>
 <body>
 <div class="wrap">
-<nav style="margin-bottom:16px">
-  <a href="/">Obfuscator</a>
-  <a href="/pro">Pro</a>
-</nav>
+<nav style="margin-bottom:16px"><a href="/">Obfuscator</a><a href="/pro">Pro</a></nav>
 <h1>KRPH Pro</h1>
-<p class="sub">Owner key required. Register → Save script → raw link (owner only).</p>
+<p class="sub">Register → Save → loadstring. DB keeps keys after restart when DATABASE_URL is set.</p>
 
 <div class="card">
-  <h3 style="margin-bottom:8px">1. Register (get owner key)</h3>
-  <p class="sub" style="margin:0">Key is shown once. Store it. Only this key can read/update your scripts.</p>
-  <div class="row">
-    <button type="button" id="btnReg">Register / Issue Key</button>
-  </div>
+  <h3 style="margin-bottom:8px">1. Register (owner key)</h3>
+  <div class="row"><button type="button" id="btnReg">Register / Issue Key</button></div>
   <div id="regMsg" class="msg" style="display:none"></div>
   <div id="keyBox" class="keybox" style="display:none"></div>
 </div>
@@ -435,20 +536,17 @@ nav a{color:#58a6ff;margin-right:14px;text-decoration:none}
   <h3 style="margin-bottom:8px">2. Save / Update script</h3>
   <label>Owner key</label>
   <input id="ownerKey" type="text" placeholder="krph_..." autocomplete="off"/>
-  <label>Script ID (leave empty to create new)</label>
-  <input id="scriptId" type="text" placeholder="optional existing id"/>
+  <label>Script ID (any name, or empty = auto)</label>
+  <input id="scriptId" type="text" placeholder="e.g. why"/>
   <label>Script source</label>
-  <textarea id="scriptBody" placeholder="-- your lua"></textarea>
-  <div class="row">
-    <button type="button" id="btnSave">Save</button>
-  </div>
+  <textarea id="scriptBody" placeholder='print("a")'></textarea>
+  <div class="row"><button type="button" id="btnSave">Save</button></div>
   <div id="saveMsg" class="msg" style="display:none"></div>
 </div>
 
 <div class="card">
   <h3 style="margin-bottom:8px">3. Run (Luarmor style)</h3>
-  <p class="sub" style="margin:0">Copy this into your executor after Save:</p>
-  <p class="warn">Wrong/missing key → You are not Owner. Script ID = any name you want.</p>
+  <p class="warn">Wrong key → You are not Owner. Only owner can update.</p>
   <div id="linkBox" class="keybox" style="display:none"></div>
 </div>
 </div>
@@ -458,86 +556,50 @@ nav a{color:#58a6ff;margin-right:14px;text-decoration:none}
   const keyBox=document.getElementById('keyBox');
   const saveMsg=document.getElementById('saveMsg');
   const linkBox=document.getElementById('linkBox');
-  const btnReg=document.getElementById('btnReg');
-  const btnSave=document.getElementById('btnSave');
+  function show(el,text,ok){el.style.display='block';el.className='msg '+(ok?'ok':'err');el.textContent=text;}
 
-  function show(el, text, ok){
-    el.style.display='block';
-    el.className='msg '+(ok?'ok':'err');
-    el.textContent=text;
-  }
-
-  btnReg.addEventListener('click', async function(){
-    regMsg.style.display='block';
-    regMsg.className='msg';
-    regMsg.textContent='Issuing key...';
+  document.getElementById('btnReg').onclick=async function(){
+    const btn=this;btn.disabled=true;
+    regMsg.style.display='block';regMsg.className='msg';regMsg.textContent='Issuing key...';
     keyBox.style.display='none';
-    btnReg.disabled=true;
     try{
       const r=await fetch('/api/register',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
       const j=await r.json();
       if(!r.ok)throw new Error(j.error||'register failed');
-      keyBox.style.display='block';
-      keyBox.textContent=j.key;
+      keyBox.style.display='block';keyBox.textContent=j.key;
       document.getElementById('ownerKey').value=j.key;
-      show(regMsg, 'Key issued. Copy and store it now.', true);
-    }catch(e){
-      show(regMsg, e.message||String(e), false);
-    }
-    btnReg.disabled=false;
-  });
+      show(regMsg,'Key issued. Keep it.',true);
+    }catch(e){show(regMsg,e.message||String(e),false);}
+    btn.disabled=false;
+  };
 
-  btnSave.addEventListener('click', async function(){
+  document.getElementById('btnSave').onclick=async function(){
     const key=document.getElementById('ownerKey').value.trim();
     const id=document.getElementById('scriptId').value.trim();
     const body=document.getElementById('scriptBody').value;
     if(!key){show(saveMsg,'Owner key required',false);return;}
     if(!body){show(saveMsg,'Script empty',false);return;}
-    saveMsg.style.display='block';
-    saveMsg.className='msg';
-    saveMsg.textContent='Saving...';
-    btnSave.disabled=true;
+    const btn=this;btn.disabled=true;
+    saveMsg.style.display='block';saveMsg.className='msg';saveMsg.textContent='Saving...';
     try{
-      const r=await fetch('/api/script',{
-        method:'POST',
-        headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({key:key,id:id||undefined,code:body})
-      });
+      const r=await fetch('/api/script',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({key:key,id:id||undefined,code:body})});
       const j=await r.json();
       if(!r.ok)throw new Error(j.error||'save failed');
       document.getElementById('scriptId').value=j.id;
-      const origin=location.origin;
-      const url=origin+'/raw/'+j.id+'?key='+encodeURIComponent(key);
-      const loader='loadstring(game:HttpGet("'+url+'"))()';
+      const url=location.origin+'/raw/'+j.id+'?key='+encodeURIComponent(key);
       linkBox.style.display='block';
-      linkBox.textContent=loader;
-      show(saveMsg, 'Saved. ID: '+j.id, true);
-    }catch(e){
-      show(saveMsg, e.message||String(e), false);
-    }
-    btnSave.disabled=false;
-  });
+      linkBox.textContent='loadstring(game:HttpGet("'+url+'"))()';
+      show(saveMsg,'Saved. ID: '+j.id,true);
+    }catch(e){show(saveMsg,e.message||String(e),false);}
+    btn.disabled=false;
+  };
 })();
 </script>
 </body>
 </html>`;
 
-function isBlacklisted(ip, key) {
-  if (ip && blacklist.ips.includes(ip)) return true;
-  if (key && blacklist.keys.includes(hashKey(key))) return true;
-  return false;
-}
-
-function addBlacklist(ip, key, reason) {
-  if (ip && !blacklist.ips.includes(ip)) blacklist.ips.push(ip);
-  if (key) {
-    const h = hashKey(key);
-    if (!blacklist.keys.includes(h)) blacklist.keys.push(h);
-  }
-  saveJSON(BLACKLIST_FILE, blacklist);
-  console.log("[BLACKLIST]", reason, ip || "", key ? key.slice(0, 12) + "..." : "");
-}
-
+/* ===================== HTTP ===================== */
 function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -558,7 +620,6 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
   const ip = (req.headers["x-forwarded-for"] || "").split(",")[0].trim() || req.socket.remoteAddress || "";
 
-  // CORS preflight
   if (req.method === "OPTIONS") {
     res.writeHead(204, {
       "Access-Control-Allow-Origin": "*",
@@ -577,7 +638,6 @@ const server = http.createServer(async (req, res) => {
   };
 
   try {
-    // ----- pages -----
     if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/index.html")) {
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
       return res.end(MAIN_HTML);
@@ -587,81 +647,55 @@ const server = http.createServer(async (req, res) => {
       return res.end(PRO_HTML);
     }
 
-    // ----- register (issue owner key) -----
     if (req.method === "POST" && url.pathname === "/api/register") {
-      // allow register even if IP was flagged; only block repeated abuse keys
+      await dbClearIpBlacklist(ip);
       const key = genKey();
       const id = genId();
-      users[hashKey(key)] = {
-        id,
-        created: Date.now(),
-        ip,
-      };
-      saveJSON(USERS_FILE, users);
-      return json(200, { key, userId: id });
+      await dbRegisterUser(hashKey(key), id, ip);
+      return json(200, { key, userId: id, db: useDb });
     }
 
-    // ----- save / update script (owner only) -----
     if (req.method === "POST" && url.pathname === "/api/script") {
       const body = await readBody(req);
       const key = (body.key || "").trim();
       if (!key) return json(403, { error: "You are not Owner" });
-      // valid registered key is never treated as blacklisted for save
       const kh = hashKey(key);
-      if (!users[kh]) {
-        if (isBlacklisted(ip, key)) return json(403, { error: "You are not Owner" });
-        addBlacklist(ip, key, "unknown-key-save");
-        return json(403, { error: "You are not Owner" });
+      if (!(await dbUserExists(kh))) {
+        return json(403, {
+          error: "Invalid key. Click Register again.",
+        });
       }
-      // un-blacklist registered owner on successful auth
-      blacklist.ips = blacklist.ips.filter((x) => x !== ip);
-      blacklist.keys = blacklist.keys.filter((x) => x !== kh);
-      saveJSON(BLACKLIST_FILE, blacklist);
+      await dbClearIpBlacklist(ip);
 
       let id = (body.id || "").trim();
       const code = body.code;
       if (typeof code !== "string") return json(400, { error: "code required" });
 
-      // allow custom id: a-z A-Z 0-9 _ - only
       if (id) {
         if (!/^[A-Za-z0-9_-]{1,64}$/.test(id)) {
           return json(400, { error: "Script ID must be 1-64 chars: A-Z a-z 0-9 _ -" });
         }
-        const existing = scripts[id];
-        if (existing) {
-          if (existing.ownerHash !== kh) {
-            return json(403, { error: "Script ID already taken" });
-          }
-          scripts[id].code = code;
-          scripts[id].updated = Date.now();
-        } else {
-          scripts[id] = {
-            ownerHash: kh,
-            code,
-            created: Date.now(),
-            updated: Date.now(),
-          };
+        const existing = await dbGetScript(id);
+        if (existing && existing.ownerHash !== kh) {
+          return json(403, { error: "Script ID already taken" });
         }
+        await dbSaveScript(id, kh, code);
       } else {
         id = genId();
-        scripts[id] = {
-          ownerHash: kh,
-          code,
-          created: Date.now(),
-          updated: Date.now(),
-        };
+        await dbSaveScript(id, kh, code);
       }
-      saveJSON(SCRIPTS_FILE, scripts);
       return json(200, { id, ok: true });
     }
 
-    // ----- raw / loader fetch (owner key required) -----
-    // /raw/:id  or  /files/v4/loaders/:id.lua  (Luarmor-style path)
+    // /raw/:id or /files/v4/loaders/:id.lua
     let rawId = null;
     if (req.method === "GET" && url.pathname.startsWith("/raw/")) {
       rawId = url.pathname.slice(5).replace(/\/$/, "").replace(/\.lua$/i, "");
     } else if (req.method === "GET" && url.pathname.startsWith("/files/v4/loaders/")) {
-      rawId = url.pathname.slice("/files/v4/loaders/".length).replace(/\/$/, "").replace(/\.lua$/i, "");
+      rawId = url.pathname
+        .slice("/files/v4/loaders/".length)
+        .replace(/\/$/, "")
+        .replace(/\.lua$/i, "");
     }
     if (rawId !== null) {
       const id = rawId;
@@ -674,18 +708,17 @@ const server = http.createServer(async (req, res) => {
         res.writeHead(403, { "Content-Type": "text/plain; charset=utf-8" });
         return res.end("You are not Owner");
       }
-      if (isBlacklisted(ip, key)) {
+      if (await dbIsBlacklisted(ip, key)) {
         res.writeHead(403, { "Content-Type": "text/plain; charset=utf-8" });
         return res.end("You are not Owner");
       }
-      const sc = scripts[id];
+      const sc = await dbGetScript(id);
       if (!sc) {
         res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
         return res.end("Not found");
       }
-      const kh = hashKey(key);
-      if (sc.ownerHash !== kh) {
-        addBlacklist(ip, key, "raw-wrong-key");
+      if (sc.ownerHash !== hashKey(key)) {
+        await dbAddBlacklist(ip, key, "raw-wrong-key");
         res.writeHead(403, { "Content-Type": "text/plain; charset=utf-8" });
         return res.end("You are not Owner");
       }
@@ -697,19 +730,20 @@ const server = http.createServer(async (req, res) => {
       return res.end(sc.code);
     }
 
-    // ----- obfuscate -----
     if (req.method === "POST" && url.pathname === "/api/obfuscate") {
       const body = await readBody(req);
-      const code = body.code;
-      if (typeof code !== "string" || !code.trim()) {
+      if (typeof body.code !== "string" || !body.code.trim()) {
         return json(400, { error: "code required" });
       }
       try {
-        const out = obfuscate(code);
-        return json(200, { code: out });
+        return json(200, { code: obfuscate(body.code) });
       } catch (e) {
         return json(500, { error: e.message || "obfuscate failed" });
       }
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/health") {
+      return json(200, { ok: true, db: useDb });
     }
 
     res.writeHead(404, { "Content-Type": "text/plain" });
@@ -721,9 +755,10 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => {
-  console.log(`KRPH listening on http://localhost:${PORT}`);
-  console.log(`  /        obfuscator`);
-  console.log(`  /pro     register + save (owner key)`);
-  console.log(`  /raw/:id?key=...`);
+initDb().then(() => {
+  server.listen(PORT, () => {
+    console.log(`KRPH listening on http://localhost:${PORT}`);
+    console.log(`  storage: ${useDb ? "Postgres" : "JSON files"}`);
+    console.log(`  /pro  /raw/:id?key=  /files/v4/loaders/:id.lua?key=`);
+  });
 });
