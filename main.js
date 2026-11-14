@@ -7,7 +7,7 @@ const http = require("http");
 const { URL } = require("url");
 const crypto = require("crypto");
 const PORT = process.env.PORT || 3000;
-const VERSION = "2.9.0";
+const VERSION = "3.1.0";
 
 const RESERVED = new Set([
   "and","break","do","else","elseif","end","false","for","function","goto","if","in",
@@ -248,21 +248,38 @@ function emitHardVm(payloadSrc, opts) {
   }
   const poolLit = poolParts.join(",");
   const realCount = chunks.length;
+  // integrity of real payload bytes (anti-tamper on pool)
+  let integritySum = 0;
+  for (const ch of chunks) for (const b of ch) integritySum = (integritySum + b) % 2147483647;
+  integritySum = (integritySum ^ seed) >>> 0;
 
+
+  const seal = rnd(6), hook = rnd(6);
   const antiParts = [
     `local function ${die}(m)return error(m or "KRPH",0)end`,
+    // seal native refs so later hooks on globals don't affect us as much
+    `local ${seal}={c=(string and string.char),b=(string and string.byte),u=(string and string.sub),l=(loadstring or load),p=pcall,t=type}`,
     `local function ${probe}()`,
-    `local s=string;local t=type;`,
-    `if t(s)~="table" and t(s)~="string" then ${die}("H1") end;`,
-    `if t(s.char)~="function" then ${die}("H2") end;`,
-    `if s.char(65)~="A" or s.char(90)~="Z" then ${die}("H3") end;`,
-    `if t(s.byte)~="function" or s.byte("A")~=65 then ${die}("H5") end;`,
-    `if t(s.sub)~="function" then ${die}("H6") end;`,
-    `if t(loadstring)~="function" and t(load)~="function" then ${die}("H4") end;`,
-    // Roblox-safe: never require debug unless jail
+    `local S=string;local t=${seal}.t;`,
+    `if t(S)~="table" and t(S)~="string" then ${die}("H1") end;`,
+    `if t(S.char)~="function" or t(${seal}.c)~="function" then ${die}("H2") end;`,
+    `if S.char~=${seal}.c then ${die}("HK1") end;`,
+    `if ${seal}.c(65)~="A" or ${seal}.c(90)~="Z" then ${die}("H3") end;`,
+    `if t(S.byte)~="function" or ${seal}.b("A")~=65 then ${die}("H5") end;`,
+    `if S.byte~=${seal}.b then ${die}("HK2") end;`,
+    `if t(S.sub)~="function" or S.sub~=${seal}.u then ${die}("HK3") end;`,
+    `local ld=loadstring or load;if t(ld)~="function" then ${die}("H4") end;`,
+    `if ld~=${seal}.l then ${die}("HK4") end;`,
+    // identity checks via behavior
+    `local ok,r=${seal}.p(function()return ${seal}.c(72,73)=="HI" end);if not ok or r~=true then ${die}("H7") end;`,
+    `return true end`,
+    `local function ${hook}()`,
+    // re-check seals mid-run (catches late hooks)
+    `if string.char~=${seal}.c or string.byte~=${seal}.b then ${die}("HK5") end;`,
+    `local ld=loadstring or load;if ld~=${seal}.l then ${die}("HK6") end;`,
     `return true end`,
     `local function ${env}()`,
-    `local ok=pcall(function()return type(_G)=="table" or type(shared)=="table" end);`,
+    `local ok=${seal}.p(function()return type(_G)=="table" or type(shared)=="table" end);`,
     `if not ok then ${die}("E1") end;`,
     `return true end`,
     `local function ${chk}(x)`,
@@ -285,11 +302,11 @@ function emitHardVm(payloadSrc, opts) {
 
   const rebuild = [
     `local function ${run}()`,
-    `${probe}();${env}();`,
+    `${probe}();${env}();${hook}();`,
     jail ? `${antiH}();` : "",
     `local seed=${seed};do local ek=0;pcall(function()if game and game.PlaceId then ek=tonumber(game.PlaceId)or 0 end end);seed=bit32.bxor(seed,bit32.band(ek,0xffffffff));end;local out={};local pos=0;`,
     `local pools={${poolLit}};`,
-    `local real=${realCount};local pi=0;`,
+    `local real=${realCount};local expect=${integritySum};local pi=0;local isum=0;`,
     `for _=1,#pools do`,
     `pi=pi+1;if pi>real then break end;`,
     `local chunk=pools[pi];`,
@@ -301,16 +318,16 @@ function emitHardVm(payloadSrc, opts) {
     `s=bit32.bxor(s,bit32.lshift(s,5));`,
     `seed=s;`,
     `local k=bit32.band(bit32.rshift(s+bit32.band(pos*0x85ebca6b,0xffffffff),(pos%4)*8),0xff);`,
-    `out[#out+1]=bit32.bxor(chunk[i],k);`,
+    `out[#out+1]=bit32.bxor(chunk[i],k);isum=(isum+chunk[i])%2147483647;`,
     `end;end;`,
-    `local parts,buf={},{};`,
+    `if bit32.bxor(isum,seed)~=expect then ${die}("INT") end;local parts,buf={},{};`,
     `for i=1,#out do`,
-    `buf[#buf+1]=string.char(out[i]);`,
+    `buf[#buf+1]=${seal}.c(out[i]);`,
     `if #buf>=28 then parts[#parts+1]=table.concat(buf);buf={} end`,
     `end;`,
     `if #buf>0 then parts[#parts+1]=table.concat(buf) end;`,
     `local src=table.concat(parts);`,
-    `local loader=loadstring or load;`,
+    `local loader=${seal}.l or loadstring or load;${hook}();`,
     `local fn,err=loader(src,"\\0");`,
     `if not fn then ${die}(tostring(err)) end;`,
     `return fn end`
@@ -361,7 +378,7 @@ function emitHardVm(payloadSrc, opts) {
     `if r~=nil then ret=r end;`,
     `if nst==nil then break end;`,
     `st=nst;`,
-    `if ${opF}(2)then st=${S.d2} end;`,
+    `if ${opF}(2)then st=${S.d2} end;if guard%5==0 then ${hook}()end;`,
     `if not ${chk}(guard%7) then st=${S.d5} end;`,
     `end;`,
     `if type(ret)=="function" then return ret(...) end;`,
