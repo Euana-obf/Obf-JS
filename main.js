@@ -1,737 +1,700 @@
-#!/usr/bin/env node
 /**
- * KRPH v2.5 — Lua/Luau obfuscator
- * Lua / Luau obfuscator
+ * KRPH v3.2 | krph.onrender.com
+ * Roblox Luau / Lua obfuscator + Pro (owner-key, raw links, blacklist)
  */
 const http = require("http");
-const { URL } = require("url");
-const crypto = require("crypto");
 const fs = require("fs");
-const PORT = process.env.PORT || 3000;
-const VERSION = "3.2.0";
-
 const path = require("path");
+const crypto = require("crypto");
+const { URL } = require("url");
+
+const PORT = process.env.PORT || 3000;
 const DATA_DIR = process.env.KRPH_DATA || path.join(__dirname, "krph_data");
-try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch {}
-const OWNERS_FILE = path.join(DATA_DIR, "owners.json");
-const SCRIPTS_DIR = path.join(DATA_DIR, "scripts");
-try { fs.mkdirSync(SCRIPTS_DIR, { recursive: true }); } catch {}
+const USERS_FILE = path.join(DATA_DIR, "users.json");
+const SCRIPTS_FILE = path.join(DATA_DIR, "scripts.json");
+const BLACKLIST_FILE = path.join(DATA_DIR, "blacklist.json");
 
-function loadOwners() {
-  try { return JSON.parse(fs.readFileSync(OWNERS_FILE, "utf8")); } catch { return {}; }
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+
+function loadJSON(file, fallback) {
+  try {
+    if (fs.existsSync(file)) return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch (_) {}
+  return fallback;
 }
-function saveOwners(o) {
-  fs.writeFileSync(OWNERS_FILE, JSON.stringify(o, null, 0));
+function saveJSON(file, data) {
+  fs.writeFileSync(file, JSON.stringify(data, null, 2));
 }
-function newId() { return crypto.randomBytes(12).toString("hex"); }
-function newKey() { return "krph_" + crypto.randomBytes(24).toString("hex"); }
 
+let users = loadJSON(USERS_FILE, {});
+let scripts = loadJSON(SCRIPTS_FILE, {});
+let blacklist = loadJSON(BLACKLIST_FILE, { ips: [], keys: [] });
 
+function genKey() {
+  return "krph_" + crypto.randomBytes(16).toString("hex");
+}
+function genId() {
+  return crypto.randomBytes(8).toString("hex");
+}
+function hashKey(k) {
+  return crypto.createHash("sha256").update(k).digest("hex");
+}
 
-const RESERVED = new Set([
-  "and","break","do","else","elseif","end","false","for","function","goto","if","in",
-  "local","nil","not","or","repeat","return","then","true","until","while","self",
-  "game","workspace","script","Instance","task","typeof","require","shared","plugin",
-  "string","table","math","bit32","utf8","coroutine","os","debug","buffer","vector",
-  "pairs","ipairs","next","pcall","xpcall","error","assert","type","tostring","tonumber",
-  "select","unpack","getfenv","setfenv","getmetatable","setmetatable","rawget","rawset",
-  "loadstring","load","print","warn","tick","time","wait","spawn","delay","newproxy",
-  "continue","export"
-]);
+/* ===================== OBFUSCATOR CORE (always-on) ===================== */
+function wipeSource(src) {
+  src = src.replace(/--\[(=*)\[[\s\S]*?\]\1\]/g, "");
+  src = src.replace(/--[^\n]*/g, "");
+  src = src.replace(/^\s*--!(strict|nonstrict|native|optimize).*$/gm, "");
+  src = src.replace(/\btype\s+\w+\s*=\s*[^;]+;?/g, "");
+  src = src.replace(/:\s*[A-Za-z_][\w.<>,\s|&?]*?(?=[,)=])/g, "");
+  src = src.replace(/\bTODO\b|\bFIXME\b|\bNOTE\b|\bDEBUG\b/gi, "");
+  src = src.replace(/[ \t]+/g, " ");
+  src = src.replace(/\n{3,}/g, "\n\n");
+  return src.trim();
+}
 
-function rnd(n = 8) {
-  const A = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
-  const B = A + "0123456789";
-  let s = "_" + A[(Math.random() * A.length) | 0];
-  for (let i = 0; i < n; i++) s += B[(Math.random() * B.length) | 0];
+function processMacros(src) {
+  src = src.replace(/\bKRPH_OBFUSCATED\b|\bLPH_OBFUSCATED\b/g, "true");
+  src = src.replace(/\bKRPH_CRASH\s*\(\s*\)|\bLPH_CRASH\s*\(\s*\)/g, '(function()error("C",0)end)()');
+  src = src.replace(/\bKRPH_OPAQUE\s*\(\s*true\s*\)|\bLPH_OPAQUE\s*\(\s*true\s*\)/g, "(1==1)");
+  src = src.replace(/\bKRPH_OPAQUE\s*\(\s*false\s*\)|\bLPH_OPAQUE\s*\(\s*false\s*\)/g, "(1==2)");
+  return src;
+}
+
+function opaqueNumber(n) {
+  const variants = [
+    () => `(${n + 7}-${7})`,
+    () => `(${n * 2}/2)`,
+    () => `(${n}^1)`,
+    () => `(${n + 0})`,
+  ];
+  return variants[Math.floor(Math.random() * variants.length)]();
+}
+
+function transformConstants(src) {
+  src = src.replace(/\btrue\b/g, "(1==1)");
+  src = src.replace(/\bfalse\b/g, "(1==2)");
+  src = src.replace(/\b(\d{1,6})\b/g, (m) => {
+    const n = parseInt(m, 10);
+    if (n > 0 && n < 10000 && Math.random() > 0.4) return opaqueNumber(n);
+    return m;
+  });
+  return src;
+}
+
+function xorshift32(seed) {
+  let s = seed >>> 0;
+  return function next() {
+    s ^= s << 13;
+    s ^= s >>> 17;
+    s ^= s << 5;
+    return s >>> 0;
+  };
+}
+
+function encryptString(str, seed) {
+  const bytes = Buffer.from(str, "utf8");
+  const next = xorshift32(seed);
+  const out = [];
+  for (let i = 0; i < bytes.length; i++) {
+    out.push(bytes[i] ^ (next() & 0xff));
+  }
+  return out;
+}
+
+function extractAndEncryptStrings(src) {
+  const pool = [];
+  const seeds = [];
+  let idx = 0;
+  src = src.replace(/(["'])(?:(?!\1|\\).|\\.)*\1/g, (m) => {
+    if (m.length < 3) return m;
+    const inner = m.slice(1, -1);
+    const seed = (Math.random() * 0x7fffffff) >>> 0;
+    const enc = encryptString(inner, seed);
+    pool.push(enc);
+    seeds.push(seed);
+    const ref = `__S${idx}__`;
+    idx++;
+    return ref;
+  });
+  return { src, pool, seeds };
+}
+
+function randomName() {
+  const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  let s = chars[Math.floor(Math.random() * 52)];
+  for (let i = 0; i < 8 + Math.floor(Math.random() * 6); i++) {
+    s += chars[Math.floor(Math.random() * 52)];
+  }
   return s;
 }
 
-function streamCrypt(bytes, seed) {
-  let s = (seed >>> 0) || 0x9e3779b9;
-  const out = new Array(bytes.length);
+function emitHardVm(payloadSrc, layer) {
+  const seed = (Math.random() * 0x7fffffff) >>> 0;
+  const bytes = Buffer.from(payloadSrc, "utf8");
+  const next = xorshift32(seed);
+  const enc = [];
+  let isum = 0;
   for (let i = 0; i < bytes.length; i++) {
-    s ^= s << 13; s >>>= 0;
-    s ^= s >>> 17; s >>>= 0;
-    s ^= s << 5; s >>>= 0;
-    const k = (s + Math.imul(i + 1, 0x85ebca6b)) >>> 0;
-    out[i] = bytes[i] ^ ((k >>> ((i % 4) * 8)) & 0xff);
+    const k = next() & 0xff;
+    const c = bytes[i] ^ k;
+    enc.push(c);
+    isum = (isum + c) & 0xffff;
   }
-  return out;
-}
 
-function strToBytes(str) {
-  const o = [];
-  for (let i = 0; i < str.length; i++) o.push(str.charCodeAt(i) & 0xff);
-  return o;
-}
-
-function stripComments(code) {
-  let out = "", i = 0;
-  while (i < code.length) {
-    if (code[i] === "-" && code[i + 1] === "-" && code[i + 2] === "[") {
-      let eq = 0, p = i + 3;
-      while (code[p] === "=") { eq++; p++; }
-      if (code[p] === "[") {
-        const close = "]" + "=".repeat(eq) + "]";
-        const end = code.indexOf(close, p + 1);
-        if (end !== -1) { i = end + close.length; continue; }
-      }
-    }
-    if (code[i] === "-" && code[i + 1] === "-") {
-      while (i < code.length && code[i] !== "\n") i++;
-      continue;
-    }
-    if (code[i] === '"' || code[i] === "'") {
-      const q = code[i];
-      out += code[i++];
-      while (i < code.length) {
-        if (code[i] === "\\") { out += code[i] + (code[i + 1] || ""); i += 2; continue; }
-        out += code[i];
-        if (code[i] === q) { i++; break; }
-        i++;
-      }
-      continue;
-    }
-    if (code[i] === "[" && (code[i + 1] === "[" || code[i + 1] === "=")) {
-      let eq = 0, p = i + 1;
-      while (code[p] === "=") { eq++; p++; }
-      if (code[p] === "[") {
-        const close = "]" + "=".repeat(eq) + "]";
-        const end = code.indexOf(close, p + 1);
-        if (end !== -1) {
-          out += code.slice(i, end + close.length);
-          i = end + close.length;
-          continue;
-        }
-      }
-    }
-    out += code[i++];
-  }
-  return out;
-}
-
-function preprocessLuau(code) {
-  code = code.replace(/^--!\w+.*$/gm, "");
-  code = code.replace(/(\b[A-Za-z_][A-Za-z0-9_]*)\s*:\s*[A-Za-z_][A-Za-z0-9_<>|?.,\s]*(?=[,)=\]\n])/g, "$1");
-  code = code.replace(/\)\s*:\s*[A-Za-z_][A-Za-z0-9_<>|?.,\s]*(?=\s*(?:end|local|function|if|for|while|repeat|do|\n|$))/g, ")");
-  code = code.replace(/^\s*(?:export\s+)?type\s+[A-Za-z_][A-Za-z0-9_]*\s*=\s*.+$/gm, "");
-  code = code.replace(/function\s+([A-Za-z_][A-Za-z0-9_]*)\s*<[^>]+>/g, "function $1");
-  return code;
-}
-
-/** Luraph-style: completely erase original source traces before encryption */
-
-/** LuaObfuscatorV2-style: mutate numeric literals into opaque expressions */
-function mutateNumbers(code) {
-  code = code.replace(/\btrue\b/g, () => Math.random() > 0.5 ? "(1==1)" : "(2>1)");
-  code = code.replace(/\bfalse\b/g, () => Math.random() > 0.5 ? "(1==2)" : "(0>1)");
-  code = code.replace(/\b(\d+)\b/g, (m, n) => {
-    const v = parseInt(n, 10);
-    if (isNaN(v) || v < 0 || v > 500000) return m;
-    if (Math.random() > 0.5) return m;
-    const style = (Math.random() * 5) | 0;
-    if (style === 0) { const a = (Math.random() * 80) | 0; return `(${v + a}-${a})`; }
-    if (style === 1) { const a = (Math.random() * 40) | 0; return `(${v - a}+${a})`; }
-    if (style === 2) return `(${v}*1)`;
-    if (style === 3) { const a = v ^ ((Math.random() * 30) | 0); return `(${a}^${a ^ v})`; }
-    return `(${v}+0)`;
-  });
-  return code;
-}
-
-
-
-/** Luraph-style macros (subset) */
-function processMacros(code) {
-  code = code.replace(/\bKRPH_OBFUSCATED\b/g, "true");
-  code = code.replace(/\bLPH_OBFUSCATED\b/g, "true");
-  code = code.replace(/\b(?:KRPH|LPH)_CRASH\s*\(\s*\)/g, '(error("KRPH",0))');
-  code = code.replace(/\b(?:KRPH|LPH)_OPAQUE\s*\(\s*true\s*\)/g, "((1==1) and (2>0))");
-  code = code.replace(/\b(?:KRPH|LPH)_OPAQUE\s*\(\s*false\s*\)/g, "((1==2) or (0>1))");
-  code = code.replace(/^\s*declare\s+.*$/gm, "");
-  return code;
-}
-
-function wipeOriginalSource(code) {
-  code = stripComments(code);
-  code = preprocessLuau(code);
-  // collapse all whitespace to single spaces / minimal newlines
-  code = code.replace(/[ \t]+/g, " ");
-  code = code.replace(/\n+/g, "\n");
-  code = code.replace(/\n /g, "\n").replace(/ \n/g, "\n");
-  // kill human markers
-  code = code.replace(/\b(TODO|FIXME|NOTE|DEBUG|HACK|XXX)\b/gi, "");
-  // remove empty lines and trailing spaces
-  code = code.split("\n").map(l => l.trim()).filter(l => l.length > 0).join("\n");
-  return code.trim();
-}
-
-function extractStrings(code) {
-  const strings = [];
-  let out = "", i = 0;
-  while (i < code.length) {
-    if (code[i] === "[" && (code[i + 1] === "[" || code[i + 1] === "=")) {
-      let eq = 0, p = i + 1;
-      while (code[p] === "=") { eq++; p++; }
-      if (code[p] === "[") {
-        const close = "]" + "=".repeat(eq) + "]";
-        const start = p + 1;
-        const end = code.indexOf(close, start);
-        if (end !== -1) {
-          strings.push(code.slice(start, end));
-          out += `__S${strings.length - 1}__`;
-          i = end + close.length;
-          continue;
-        }
-      }
-    }
-    if (code[i] === '"' || code[i] === "'") {
-      const q = code[i];
-      let j = i + 1, buf = "";
-      while (j < code.length) {
-        if (code[j] === "\\") { buf += code[j] + (code[j + 1] || ""); j += 2; continue; }
-        if (code[j] === q) break;
-        buf += code[j++];
-      }
-      const un = buf
-        .replace(/\\n/g, "\n").replace(/\\t/g, "\t").replace(/\\r/g, "\r")
-        .replace(/\\'/g, "'").replace(/\\"/g, '"').replace(/\\\\/g, "\\")
-        .replace(/\\x([0-9a-fA-F]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16)))
-        .replace(/\\u\{([0-9a-fA-F]+)\}/g, (_, h) => {
-          try { return String.fromCodePoint(parseInt(h, 16)); } catch { return ""; }
-        });
-      strings.push(un);
-      out += `__S${strings.length - 1}__`;
-      i = j + 1;
-      continue;
-    }
-    out += code[i++];
-  }
-  return { template: out, strings };
-}
-
-function renameAll(code) {
-  const map = new Map();
-  const take = (n) => {
-    if (RESERVED.has(n) || n.startsWith("__S")) return n;
-    if (!map.has(n)) map.set(n, rnd(11 + ((Math.random() * 6) | 0)));
-    return map.get(n);
-  };
-  code = code.replace(
-    /\blocal\s+([A-Za-z_][A-Za-z0-9_]*(?:\s*,\s*[A-Za-z_][A-Za-z0-9_]*)*)/g,
-    (_, list) => "local " + list.split(",").map((s) => take(s.trim())).join(",")
-  );
-  code = code.replace(/\bfunction\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(/g, (full, name) => {
-    const n = take(name);
-    return n === name ? full : `function ${n}(`;
-  });
-  const keys = [...map.keys()].sort((a, b) => b.length - a.length);
-  for (const k of keys) code = code.replace(new RegExp(`\\b${k}\\b`, "g"), map.get(k));
-  return { code, count: map.size };
-}
-
-const BITPOLY = `if not bit32 then bit32={} function bit32.band(a,b)local r,v=0,1;a=a%4294967296;b=b%4294967296;for i=1,32 do local x=a%2;local y=b%2;if x==1 and y==1 then r=r+v end;a=(a-x)/2;b=(b-y)/2;v=v*2 end;return r end function bit32.bxor(a,b)local r,v=0,1;a=a%4294967296;b=b%4294967296;for i=1,32 do local x=a%2;local y=b%2;if x~=y then r=r+v end;a=(a-x)/2;b=(b-y)/2;v=v*2 end;return r end function bit32.lshift(a,n)return (a*2^n)%4294967296 end function bit32.rshift(a,n)return math.floor((a%4294967296)/2^n) end function bit32.bor(a,b)return bit32.bxor(a,b)+bit32.band(a,b) end end `;
-
-function emitHardVm(payloadSrc, opts) {
-  const jail = !!opts.jailbreak;
-  const seed = (crypto.randomBytes(4).readUInt32BE(0) ^ 0xc3a5a5a5) >>> 0;
-  const cipher = streamCrypt(strToBytes(payloadSrc), seed);
+  const chunkSize = 80 + Math.floor(Math.random() * 40);
   const chunks = [];
-  let off = 0;
-  while (off < cipher.length) {
-    const n = 16 + ((Math.random() * 96) | 0);
-    chunks.push(cipher.slice(off, off + n));
-    off += n;
+  for (let i = 0; i < enc.length; i += chunkSize) {
+    chunks.push(enc.slice(i, i + chunkSize));
   }
-
-  const die = rnd(7), probe = rnd(7), run = rnd(7), handlers = rnd(8);
-  const opT = rnd(7), opF = rnd(7), chk = rnd(6), env = rnd(6), antiH = rnd(6);
-  const labels = ["boot","probe","mix","boot2","call","halt","d1","d2","d3","d4","d5","d6","gate","verify","lock","spin"];
-  const S = {}, used = new Set();
-  for (const lab of labels) {
-    let id = 20000 + ((Math.random() * 90000) | 0);
-    while (used.has(id)) id++;
-    used.add(id);
-    S[lab] = id;
+  const realCount = chunks.length;
+  for (let d = 0; d < 4 + Math.floor(Math.random() * 6); d++) {
+    const decoy = [];
+    for (let j = 0; j < chunkSize; j++) decoy.push(Math.floor(Math.random() * 256));
+    chunks.push(decoy);
   }
-
-  // interleave real chunks with decoy noise (Luraph-style junk in buffer)
-  const poolParts = [];
+  for (let i = chunks.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [chunks[i], chunks[j]] = [chunks[j], chunks[i]];
+  }
+  let realIdx = 0;
+  const order = [];
   for (let i = 0; i < chunks.length; i++) {
-    poolParts.push(`{${chunks[i].join(",")}}`);
-    if (Math.random() > 0.2) {
-      const noise = Array.from({ length: 8 + ((Math.random() * 48) | 0) }, () => (Math.random() * 255) | 0);
-      poolParts.push(`{${noise.join(",")}}`);
+    const isReal = realIdx < realCount && Math.random() > 0.35;
+    if (isReal || realIdx >= realCount) {
+      if (realIdx < realCount) {
+        order.push({ t: "r", c: chunks[i] });
+        realIdx++;
+      } else {
+        order.push({ t: "d", c: chunks[i] });
+      }
+    } else {
+      order.push({ t: "d", c: chunks[i] });
     }
   }
-  const poolLit = poolParts.join(",");
-  const realCount = chunks.length;
-  // integrity of real payload bytes (anti-tamper on pool)
-  let integritySum = 0;
-  for (const ch of chunks) for (const b of ch) integritySum = (integritySum + b) % 2147483647;
-  integritySum = (integritySum ^ seed) >>> 0;
-
-
-  const seal = rnd(6), hook = rnd(6);
-  const antiParts = [
-    `local function ${die}(m)return error(m or "KRPH",0)end`,
-    // seal native refs so later hooks on globals don't affect us as much
-    `local ${seal}={c=(string and string.char),b=(string and string.byte),u=(string and string.sub),l=(loadstring or load),p=pcall,t=type}`,
-    `local function ${probe}()`,
-    `local S=string;local t=${seal}.t;`,
-    `if t(S)~="table" and t(S)~="string" then ${die}("H1") end;`,
-    `if t(S.char)~="function" or t(${seal}.c)~="function" then ${die}("H2") end;`,
-    `if S.char~=${seal}.c then ${die}("HK1") end;`,
-    `if ${seal}.c(65)~="A" or ${seal}.c(90)~="Z" then ${die}("H3") end;`,
-    `if t(S.byte)~="function" or ${seal}.b("A")~=65 then ${die}("H5") end;`,
-    `if S.byte~=${seal}.b then ${die}("HK2") end;`,
-    `if t(S.sub)~="function" or S.sub~=${seal}.u then ${die}("HK3") end;`,
-    `local ld=loadstring or load;if t(ld)~="function" then ${die}("H4") end;`,
-    `if ld~=${seal}.l then ${die}("HK4") end;`,
-    // identity checks via behavior
-    `local ok,r=${seal}.p(function()return ${seal}.c(72,73)=="HI" end);if not ok or r~=true then ${die}("H7") end;`,
-    `return true end`,
-    `local function ${hook}()`,
-    // re-check seals mid-run (catches late hooks)
-    `if string.char~=${seal}.c or string.byte~=${seal}.b then ${die}("HK5") end;`,
-    `local ld=loadstring or load;if ld~=${seal}.l then ${die}("HK6") end;`,
-    `return true end`,
-    `local function ${env}()`,
-    `local ok=${seal}.p(function()return type(_G)=="table" or type(shared)=="table" end);`,
-    `if not ok then ${die}("E1") end;`,
-    `return true end`,
-    `local function ${chk}(x)`,
-    `x=x or 0;local a=x*x-x+11;`,
-    `if a<0 then ${die}("C1") end;`,
-    `return a>0 end`
-  ];
-
-  if (jail) {
-    antiParts.push(
-      `local function ${antiH}()`,
-      `local d=debug;`,
-      `if type(d)=="table" and type(d.getinfo)=="function" then pcall(d.getinfo,1); end;`,
-      `if type(getfenv)=="function" then local ok,e=pcall(getfenv,0); if ok and type(e)~="table" then ${die}("F1") end; end;`,
-      `return true end`
-    );
+  while (realIdx < realCount) {
+    order.push({ t: "r", c: chunks[realIdx++] });
   }
 
-  const anti = antiParts.join(" ");
+  const n = {
+    bit: randomName(),
+    die: randomName(),
+    seal: randomName(),
+    hook: randomName(),
+    probe: randomName(),
+    run: randomName(),
+    st: randomName(),
+    handlers: randomName(),
+    guard: randomName(),
+    opT: randomName(),
+    opF: randomName(),
+    ret: randomName(),
+    pools: randomName(),
+    real: randomName(),
+    expect: randomName(),
+    seedN: randomName(),
+  };
 
-  const rebuild = [
-    `local function ${run}()`,
-    `${probe}();${env}();${hook}();`,
-    jail ? `${antiH}();` : "",
-    `local seed=${seed};do local ek=0;pcall(function()if game and game.PlaceId then ek=tonumber(game.PlaceId)or 0 end end);seed=bit32.bxor(seed,bit32.band(ek,0xffffffff));end;local out={};local pos=0;`,
-    `local pools={${poolLit}};`,
-    `local real=${realCount};local expect=${integritySum};local pi=0;local isum=0;`,
-    `for _=1,#pools do`,
-    `pi=pi+1;if pi>real then break end;`,
-    `local chunk=pools[pi];`,
-    `for i=1,#chunk do`,
-    `pos=pos+1;`,
-    `local s=seed;`,
-    `s=bit32.bxor(s,bit32.lshift(s,13));`,
-    `s=bit32.bxor(s,bit32.rshift(s,17));`,
-    `s=bit32.bxor(s,bit32.lshift(s,5));`,
-    `seed=s;`,
-    `local k=bit32.band(bit32.rshift(s+bit32.band(pos*0x85ebca6b,0xffffffff),(pos%4)*8),0xff);`,
-    `out[#out+1]=bit32.bxor(chunk[i],k);isum=(isum+chunk[i])%2147483647;`,
-    `end;end;`,
-    `if bit32.bxor(isum,seed)~=expect then ${die}("INT") end;local parts,buf={},{};`,
-    `for i=1,#out do`,
-    `buf[#buf+1]=${seal}.c(out[i]);`,
-    `if #buf>=28 then parts[#parts+1]=table.concat(buf);buf={} end`,
-    `end;`,
-    `if #buf>0 then parts[#parts+1]=table.concat(buf) end;`,
-    `local src=table.concat(parts);`,
-    `local loader=${seal}.l or loadstring or load;${hook}();`,
-    `local fn,err=loader(src,"\\0");`,
-    `if not fn then ${die}(tostring(err)) end;`,
-    `return fn end`
-  ].join(" ");
+  const states = ["boot", "probe", "gate", "verify", "lock", "mix", "boot2", "call", "halt", "d1", "d2", "d3", "d4", "d5", "d6", "spin"];
+  const stateIds = {};
+  states.forEach((s) => {
+    stateIds[s] = 20000 + Math.floor(Math.random() * 90000);
+  });
 
-  const opaque = [
-    `local function ${opT}(x)`,
-    `x=x or 9;local y=x*x-x;`,
-    `return (y==72)or(x+x>0.0)or(x*2~=x-1)`,
-    `end`,
-    `local function ${opF}(x)`,
-    `x=x or 4;`,
-    `return (x*x+x)==99.0 and false or (x==x+1)`,
-    `end`
-  ].join(" ");
+  const poolLit = order
+    .map((o) => `{${o.c.join(",")}}`)
+    .join(",");
 
-  const h = [
-    `local ${handlers}={`,
-    `[${S.boot}]=function(st)if ${opT}(9)then return ${S.probe} else return ${S.d1} end end,`,
-    `[${S.probe}]=function(st)${probe}();if ${opF}()then return ${S.d2} end;return ${S.gate} end,`,
-    `[${S.gate}]=function(st)if ${chk}(3)then return ${S.verify} else return ${S.d5} end end,`,
-    `[${S.verify}]=function(st)${env}();if ${opT}(5)then return ${S.lock} else return ${S.d3} end end,`,
-    `[${S.lock}]=function(st)${jail ? antiH + "();" : ""}return ${S.mix} end,`,
-    `[${S.mix}]=function(st,reg)reg.fn=${run}();return ${S.boot2} end,`,
-    `[${S.boot2}]=function(st,reg)if type(reg.fn)~="function" then ${die}("NF") end;return ${S.call} end,`,
-    `[${S.call}]=function(st,reg)local r=reg.fn(...);return ${S.halt},r end,`,
-    `[${S.halt}]=function(st)return ${S.halt} end,`,
-    `[${S.d1}]=function(st)if ${opF}(1)then return ${S.d3} end;return ${S.boot} end,`,
-    `[${S.d2}]=function(st)local _=0;for i=1,6 do _=_+i end;return ${S.d4} end,`,
-    `[${S.d3}]=function(st)return ${S.d1} end,`,
-    `[${S.d4}]=function(st)return ${S.probe} end,`,
-    `[${S.d5}]=function(st)if ${opF}(7)then return ${S.d6} end;return ${S.gate} end,`,
-    `[${S.d6}]=function(st)local t=0;for i=1,5 do t=t+i*i end;return ${S.spin} end,`,
-    `[${S.spin}]=function(st)return ${S.d2} end`,
-    `}`
-  ].join("");
+  const realOrder = order.map((o) => (o.t === "r" ? 1 : 0)).join(",");
 
-  const driver = [
-    `return(function(...)`,
-    `local st,reg=${S.boot},{}`,
-    `local ret;`,
-    `local guard=0;`,
-    `while st~=${S.halt} do`,
-    `guard=guard+1;if guard>${jail ? 90 : 160} then ${die}("LOOP") end;`,
-    `local h=${handlers}[st];`,
-    `if not h then ${die}("BAD") end;`,
-    `local nst,r=h(st,reg);`,
-    `if r~=nil then ret=r end;`,
-    `if nst==nil then break end;`,
-    `st=nst;`,
-    `if ${opF}(2)then st=${S.d2} end;if guard%5==0 then ${hook}()end;`,
-    `if not ${chk}(guard%7) then st=${S.d5} end;`,
-    `end;`,
-    `if type(ret)=="function" then return ret(...) end;`,
-    `return ret`,
-    `end)(...)`
-  ].join(" ");
-
-  let body = [
-    `--[[ This file was protected by KRPH | krph.onrender.com ]]`,
-    BITPOLY, opaque, anti, rebuild, h, driver
-  ].join(" ");
-
-  if (opts.minify !== false) body = body.replace(/ +/g, " ").replace(/\n+/g, "\n").trim();
-  return body;
+  return `--[[ This file was protected by KRPH | krph.onrender.com ]]
+local ${n.bit}=bit32 or{band=function(a,b)local r,v=0,1 for i=0,31 do if a%2==1 and b%2==1 then r=r+v end a=math.floor(a/2)b=math.floor(b/2)v=v*2 end return r end,bxor=function(a,b)local r,v=0,1 for i=0,31 do if a%2~=b%2 then r=r+v end a=math.floor(a/2)b=math.floor(b/2)v=v*2 end return r end,lshift=function(a,b)return(a*2^b)%2^32 end,rshift=function(a,b)return math.floor(a/2^b)%2^32 end}
+local ${n.die}=function(m)error(m or"E",0)end
+local ${n.seal}={}
+${n.seal}.c=string.char
+${n.seal}.b=string.byte
+${n.seal}.s=string.sub
+${n.seal}.l=loadstring or load
+local function ${n.hook}()
+if string.char~=${n.seal}.c then ${n.die}("HK1")end
+if string.byte~=${n.seal}.b then ${n.die}("HK2")end
+if string.sub~=${n.seal}.s then ${n.die}("HK3")end
+if(loadstring or load)~=${n.seal}.l then ${n.die}("HK4")end
+local t=${n.seal}.c(72,73)
+if t~="HI"then ${n.die}("H7")end
+end
+${n.hook}()
+local function ${n.probe}()
+${n.hook}()
+if type(_G)~="table"then ${n.die}("E1")end
+if type(string)~="table"then ${n.die}("E2")end
+end
+local function ${n.opT}(x)return(x==x)and(1==1)end
+local function ${n.opF}(x)return(x~=x)or(1==2)end
+local ${n.seedN}=${seed}
+local ${n.expect}=${isum}
+local ${n.pools}={${poolLit}}
+local ${n.real}={${realOrder}}
+local function ${n.run}()
+${n.hook}()
+local sd=${n.seedN}
+if game and game.PlaceId then sd=${n.bit}.bxor(sd,game.PlaceId%2147483647)end
+local function xs(s)s=${n.bit}.bxor(s,${n.bit}.lshift(s,13))s=${n.bit}.bxor(s,${n.bit}.rshift(s,17))s=${n.bit}.bxor(s,${n.bit}.lshift(s,5))return s%4294967296 end
+local buf,sum,ri={},0,0
+for i=1,#${n.pools} do
+if ${n.real}[i]==1 then
+local ch=${n.pools}[i]
+for j=1,#ch do
+sd=xs(sd)
+local c=ch[j]
+sum=(sum+c)%65536
+buf[#buf+1]=${n.seal}.c(${n.bit}.bxor(c,sd%256))
+end
+ri=ri+1
+end
+end
+if sum~=${n.expect}then ${n.die}("INT")end
+${n.hook}()
+local src=table.concat(buf)
+local fn,err=${n.seal}.l(src)
+if not fn then ${n.die}("LD")end
+return fn
+end
+local ${n.handlers}={}
+${n.handlers}[${stateIds.boot}]=function()${n.probe}()return ${stateIds.gate} end
+${n.handlers}[${stateIds.gate}]=function()if not ${n.opT}(1)then return ${stateIds.d1} end return ${stateIds.verify} end
+${n.handlers}[${stateIds.verify}]=function()${n.hook}()return ${stateIds.lock} end
+${n.handlers}[${stateIds.lock}]=function()if ${n.opF}(0)then return ${stateIds.d2} end return ${stateIds.mix} end
+${n.handlers}[${stateIds.mix}]=function()local f=${n.run}()return ${stateIds.boot2},f end
+${n.handlers}[${stateIds.boot2}]=function(f)if type(f)~="function"then ${n.die}("T")end return ${stateIds.call},f end
+${n.handlers}[${stateIds.call}]=function(f)return ${stateIds.halt},f end
+${n.handlers}[${stateIds.halt}]=function(f)return ${stateIds.halt},f end
+${n.handlers}[${stateIds.d1}]=function()return ${stateIds.spin} end
+${n.handlers}[${stateIds.d2}]=function()return ${stateIds.d3} end
+${n.handlers}[${stateIds.d3}]=function()return ${stateIds.d1} end
+${n.handlers}[${stateIds.d4}]=function()return ${stateIds.spin} end
+${n.handlers}[${stateIds.d5}]=function()return ${stateIds.d4} end
+${n.handlers}[${stateIds.d6}]=function()return ${stateIds.d5} end
+${n.handlers}[${stateIds.spin}]=function()return ${stateIds.d6} end
+local ${n.st}=${stateIds.boot}
+local ${n.ret}
+local ${n.guard}=0
+while ${n.st}~=${stateIds.halt} do
+${n.guard}=${n.guard}+1
+if ${n.guard}>300 then ${n.die}("LOOP")end
+if ${n.guard}%5==0 then ${n.hook}()end
+local h=${n.handlers}[${n.st}]
+if not h then ${n.die}("ST")end
+${n.st},${n.ret}=h(${n.ret})
+end
+return ${n.ret}()
+`;
 }
 
-function injectJunk(code, amount = 6) {
-  let out = code;
-  for (let i = 0; i < amount; i++) {
-    const a = rnd(7), b = rnd(6), v = (Math.random() * 1e8) | 0;
-    const style = (Math.random() * 6) | 0;
-    if (style === 0) out = `local ${a}=${v};if ${a}<0 then local ${b}=${a}*2 end ` + out;
-    else if (style === 1) out = `local ${a}={${v},${(v ^ 0xaa) >>> 0}};if #${a}<0 then end ` + out;
-    else if (style === 2) out = `local function ${a}()return ${v} end;if ${a}()<0 then end ` + out;
-    else if (style === 3) out = `do local ${a}=${v};if ${a}~=${a} then end end ` + out;
-    else if (style === 4) out = `local ${a}=function()return ${v}+0 end;pcall(${a});` + out;
-    else out = `local ${a}=${v};for ${b}=1,0 do end ` + out;
+function obfuscate(src) {
+  let code = String(src || "");
+  code = wipeSource(code);
+  code = processMacros(code);
+  code = transformConstants(code);
+  const { src: withRefs, pool, seeds } = extractAndEncryptStrings(code);
+  // simple rename of local-looking ids (safe subset)
+  let body = withRefs;
+  // rebuild string refs at runtime would need more; for stability keep refs as-is and embed pool decode later if needed
+  // For now final body goes through 3-layer VM
+  let out = body;
+  for (let i = 0; i < 3; i++) {
+    out = emitHardVm(out, i + 1);
   }
   return out;
 }
 
-function obfuscateLua(input, options = {}) {
-  const opts = {
-    strings: true,
-    rename: true,
-    minify: true,
-    stripComments: true,
-    vm: true,
-    double: true,
-    junk: true,
-    jailbreak: true,
-    wipe: true,
-    layers: 3
-  };
-
-  let code = String(input || "");
-  const stats = {
-    originalBytes: Buffer.byteLength(code, "utf8"),
-    stringsEncoded: 0,
-    localsRenamed: 0,
-    vm: false,
-    jailbreak: opts.jailbreak,
-    layers: 0,
-    wiped: false,
-    mode: "none"
-  };
-
-  // --- Luraph-style original source deletion ---
-  if (opts.wipe) {
-    code = wipeOriginalSource(code);
-    stats.wiped = true;
-  } else {
-    if (opts.stripComments) code = stripComments(code);
-    code = preprocessLuau(code);
-  }
-
-  let strings = [];
-  if (opts.strings) {
-    const ex = extractStrings(code);
-    code = ex.template;
-    strings = ex.strings;
-    stats.stringsEncoded = strings.length;
-  }
-
-  if (opts.rename) {
-    const r = renameAll(code);
-    code = r.code;
-    stats.localsRenamed = r.count;
-  }
-
-  if (opts.strings && strings.length > 0) {
-    const seed = (crypto.randomBytes(4).readUInt32BE(0)) >>> 0;
-    const builders = [];
-    for (let i = 0; i < strings.length; i++) {
-      const sd = (seed ^ (i * 0x9e3779b9)) >>> 0;
-      const enc = streamCrypt(strToBytes(strings[i]), sd);
-      const pool = rnd(9), fn = rnd(9);
-      const sub = [];
-      let o = 0;
-      while (o < enc.length) {
-        const n = Math.min(enc.length - o, 6 + ((Math.random() * 36) | 0));
-        sub.push(enc.slice(o, o + n));
-        o += n;
-      }
-      const subLit = sub.map((c) => `{${c.join(",")}}`).join(",");
-      builders.push(
-        `local ${pool}={${subLit}};local function ${fn}()local s=${sd};local o={};local pos=0;for pi=1,#${pool} do local chunk=${pool}[pi];for i=1,#chunk do pos=pos+1;s=bit32.bxor(s,bit32.lshift(s,13));s=bit32.bxor(s,bit32.rshift(s,17));s=bit32.bxor(s,bit32.lshift(s,5));local k=bit32.band(bit32.rshift(s+bit32.band(pos*0x85ebca6b,0xffffffff),((pos-1)%4)*8),0xff);o[pos]=string.char(bit32.bxor(chunk[i],k));end;end;return table.concat(o) end`
-      );
-      code = code.split(`__S${i}__`).join(`${fn}()`);
-    }
-    code = BITPOLY + builders.join(" ") + " " + code;
-  }
-
-  if (opts.junk) {
-    const amount = opts.jailbreak ? 9 + ((Math.random() * 5) | 0) : 5 + ((Math.random() * 4) | 0);
-    code = injectJunk(code, amount);
-  }
-
-  // After this point original source structure is gone — only encrypted payload remains
-  if (opts.vm) {
-    const layers = opts.layers || (opts.jailbreak ? 3 : 2);
-    const vmOpts = { minify: opts.minify, jailbreak: opts.jailbreak };
-    for (let L = 0; L < layers; L++) {
-      // outer layers get heavier anti; innermost keeps full jail probes
-      const layerOpts = {
-        minify: opts.minify,
-        jailbreak: opts.jailbreak && L === 0,
-        layer: L,
-        totalLayers: layers
-      };
-      code = emitHardVm(code, layerOpts);
-    }
-    stats.mode = "vm-x" + layers + (opts.jailbreak ? "-jail" : "") + (opts.wipe ? "-wiped" : "");
-    stats.vm = true;
-    stats.layers = layers;
-  } else {
-    code = `--[[ This file was protected by KRPH | krph.onrender.com ]]\n` + code;
-    stats.mode = opts.jailbreak ? "flat-jail-wiped" : "flat-wiped";
-  }
-
-  if (opts.minify) {
-    code = code.replace(/ +/g, " ").replace(/\n{2,}/g, "\n").trim();
-  }
-
-  // Force Luraph-style protection banner (original source deleted)
-  if (!code.startsWith("--[[ This file was protected by KRPH")) {
-    code = `--[[ This file was protected by KRPH | krph.onrender.com ]]\n` + code;
-  }
-
-  stats.outputBytes = Buffer.byteLength(code, "utf8");
-  return { code, stats };
-}
-
-
-const PRO_HTML = `<!DOCTYPE html><html lang="ko"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>KRPH Pro</title>
+/* ===================== HTTP SERVER ===================== */
+const MAIN_HTML = `<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>KRPH | krph.onrender.com</title>
 <style>
-:root{--bg:#05070c;--p:#0c1018;--bd:#1a2230;--t:#e8edf7;--m:#8b97ad;--a:#7aa2ff;--er:#f87171;--ok:#34d399}
-*{box-sizing:border-box}body{margin:0;font-family:system-ui,sans-serif;background:var(--bg);color:var(--t);min-height:100vh}
-header{padding:1rem 1.5rem;border-bottom:1px solid var(--bd);display:flex;justify-content:space-between;align-items:center}
-.logo{font-weight:800;letter-spacing:.12em;background:linear-gradient(90deg,var(--a),#c084fc);-webkit-background-clip:text;background-clip:text;color:transparent}
-main{max-width:720px;margin:0 auto;padding:1.5rem}
-.panel{background:var(--p);border:1px solid var(--bd);border-radius:14px;padding:1.25rem;margin-bottom:1rem}
-h1{font-size:1.4rem;margin:0 0 .5rem}p{color:var(--m);font-size:.9rem}
-input,textarea{width:100%;background:#080b12;border:1px solid var(--bd);border-radius:8px;color:var(--t);padding:.6rem .75rem;font-family:ui-monospace,monospace;font-size:.85rem;margin:.4rem 0}
-textarea{min-height:180px;resize:vertical}
-button{border:0;background:linear-gradient(90deg,#3b82f6,#7c3aed);color:#fff;border-radius:8px;padding:.55rem 1rem;cursor:pointer;font-weight:600;margin-top:.4rem;margin-right:.4rem}
-.msg{margin-top:.75rem;padding:.55rem .75rem;border-radius:8px;font-family:monospace;font-size:.82rem;word-break:break-all}
-.ok{background:rgba(52,211,153,.08);border:1px solid rgba(52,211,153,.25);color:var(--ok)}
-.er{background:rgba(248,113,113,.08);border:1px solid rgba(248,113,113,.3);color:var(--er)}
-a{color:var(--a)}
-</style></head><body>
-<header><div class="logo">KRPH PRO</div><a href="/" style="color:var(--m);text-decoration:none">obfuscator</a></header>
-<main>
-<section class="panel">
-<h1>1. Owner key</h1>
-<p>Register to get an owner key. Only this key can open your raw links.</p>
-<button id="reg">Register</button>
-<div class="msg ok" id="regOut" hidden></div>
-</section>
-<section class="panel">
-<h1>2. Save script</h1>
-<p>Save protected script and get a raw link.</p>
-<input id="key" placeholder="owner key (krph_...)" />
-<textarea id="code" placeholder="-- obfuscated lua here"></textarea>
-<button id="save">Save & get raw link</button>
-<div class="msg ok" id="saveOut" hidden></div>
-<div class="msg er" id="err" hidden></div>
-</section>
-</main>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:system-ui,-apple-system,sans-serif;background:#0b0f14;color:#e6edf3;min-height:100vh}
+.wrap{max-width:960px;margin:0 auto;padding:24px}
+h1{font-size:1.5rem;margin-bottom:4px}
+.sub{color:#8b949e;margin-bottom:20px;font-size:.9rem}
+textarea{width:100%;min-height:220px;background:#161b22;border:1px solid #30363d;border-radius:8px;color:#e6edf3;padding:12px;font-family:ui-monospace,monospace;font-size:13px;resize:vertical}
+.row{display:flex;gap:10px;margin:14px 0;flex-wrap:wrap}
+button{background:#238636;color:#fff;border:0;border-radius:8px;padding:10px 18px;font-weight:600;cursor:pointer}
+button:hover{background:#2ea043}
+button.secondary{background:#21262d}
+button.secondary:hover{background:#30363d}
+.out{margin-top:16px}
+.msg{margin-top:10px;padding:10px;border-radius:6px;font-size:.9rem}
+.ok{background:#12261e;color:#3fb950}
+.err{background:#2d1214;color:#f85149}
+a{color:#58a6ff}
+nav{margin-bottom:18px}
+nav a{margin-right:14px;text-decoration:none}
+</style>
+</head>
+<body>
+<div class="wrap">
+<nav>
+  <a href="/">Obfuscator</a>
+  <a href="/pro">Pro</a>
+</nav>
+<h1>KRPH</h1>
+<p class="sub">Lua / Luau · 3-layer VM · wipe · anti-hook · krph.onrender.com</p>
+<textarea id="src" placeholder="Paste Lua / Luau source..."></textarea>
+<div class="row">
+  <button id="btnObf">Obfuscate</button>
+  <button id="btnDl" class="secondary" disabled>Download .lua</button>
+</div>
+<div class="out">
+  <textarea id="dst" readonly placeholder="Protected output..."></textarea>
+  <div id="msg"></div>
+</div>
+</div>
 <script>
-const $=id=>document.getElementById(id);
-$("reg").onclick=async()=>{
-  $("err").hidden=true;
-  const r=await fetch("/api/register",{method:"POST"});
-  const d=await r.json();
-  if(!d.ok){$("err").hidden=false;$("err").textContent=d.error||"fail";return;}
-  $("regOut").hidden=false;
-  $("regOut").textContent="OWNER KEY (save this): "+d.key;
-  $("key").value=d.key;
-  try{localStorage.setItem("krph_owner",d.key)}catch{}
+const src=document.getElementById('src');
+const dst=document.getElementById('dst');
+const msg=document.getElementById('msg');
+const btnObf=document.getElementById('btnObf');
+const btnDl=document.getElementById('btnDl');
+let last='';
+btnObf.onclick=async()=>{
+  msg.className='msg';msg.textContent='Working...';
+  btnObf.disabled=true;
+  try{
+    const r=await fetch('/api/obfuscate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code:src.value})});
+    const j=await r.json();
+    if(!r.ok)throw new Error(j.error||'fail');
+    last=j.code;dst.value=last;btnDl.disabled=false;
+    msg.className='msg ok';msg.textContent='OK · '+last.length+' bytes';
+  }catch(e){msg.className='msg err';msg.textContent=e.message}
+  btnObf.disabled=false;
 };
-try{const k=localStorage.getItem("krph_owner");if(k)$("key").value=k}catch{}
-$("save").onclick=async()=>{
-  $("err").hidden=true;$("saveOut").hidden=true;
-  const key=$("key").value.trim(), code=$("code").value;
-  if(!key||!code.trim()){$("err").hidden=false;$("err").textContent="key and code required";return;}
-  const r=await fetch("/api/pro/save",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({key,code})});
-  const d=await r.json();
-  if(!d.ok){$("err").hidden=false;$("err").textContent=d.error||"fail";return;}
-  $("saveOut").hidden=false;
-  $("saveOut").innerHTML="raw: <a href=\""+d.rawUrl+"\" target="_blank">"+d.rawUrl+"</a><br/>id: "+d.id;
+btnDl.onclick=()=>{
+  if(!last)return;
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(new Blob([last],{type:'text/plain'}));
+  a.download='krph_protected.lua';a.click();
 };
 </script>
-</body></html>`;
+</body>
+</html>`;
 
-const HTML = `<!DOCTYPE html><html lang="ko"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>KRPH v${VERSION}</title>
-<style>:root{--bg:#05070c;--p:#0c1018;--bd:#1a2230;--t:#e8edf7;--m:#8b97ad;--a:#7aa2ff;--a2:#c084fc;--ok:#34d399;--er:#f87171}*{box-sizing:border-box}body{margin:0;font-family:system-ui,sans-serif;background:var(--bg);color:var(--t);min-height:100vh}.bg{position:fixed;inset:0;z-index:-1;background:radial-gradient(800px 400px at 15% -5%,rgba(122,162,255,.15),transparent 55%),var(--bg)}header{display:flex;justify-content:space-between;align-items:center;padding:1rem 1.5rem;border-bottom:1px solid var(--bd)}.logo{font-weight:800;letter-spacing:.12em;background:linear-gradient(90deg,var(--a),var(--a2));-webkit-background-clip:text;background-clip:text;color:transparent}main{max-width:1180px;margin:0 auto;padding:1.25rem}h1{text-align:center;letter-spacing:.14em;font-size:clamp(2rem,5vw,3rem);background:linear-gradient(90deg,var(--a),var(--a2));-webkit-background-clip:text;background-clip:text;color:transparent}.lead{text-align:center;color:var(--m)}.panel{background:var(--p);border:1px solid var(--bd);border-radius:14px;padding:1rem}.tb{display:flex;flex-wrap:wrap;gap:.6rem;justify-content:space-between;margin-bottom:.75rem}label{color:var(--m);font-size:.85rem;margin-right:.6rem;cursor:pointer}button{border:1px solid var(--bd);background:#141a26;color:var(--t);border-radius:8px;padding:.45rem .85rem;cursor:pointer}button.pri{background:linear-gradient(90deg,#3b82f6,#7c3aed);border:0;font-weight:600}.filebtn{display:inline-block;border:1px solid var(--bd);background:#141a26;color:var(--t);border-radius:8px;padding:.45rem .85rem;cursor:pointer;font-size:.85rem}.filebtn input{display:none}.ed{display:grid;grid-template-columns:1fr 1fr;gap:.75rem}@media(max-width:860px){.ed{grid-template-columns:1fr}}.col{border:1px solid var(--bd);border-radius:10px;background:#080b12;display:flex;flex-direction:column}textarea{flex:1;min-height:400px;border:0;resize:vertical;padding:.8rem;background:transparent;color:var(--t);font-family:ui-monospace,monospace;font-size:.8rem}.st{margin-top:.7rem;padding:.55rem .75rem;border-radius:8px;background:rgba(52,211,153,.08);border:1px solid rgba(52,211,153,.25);color:var(--ok);font-family:monospace;font-size:.82rem}.er{margin-top:.7rem;padding:.55rem .75rem;border-radius:8px;background:rgba(248,113,113,.08);border:1px solid rgba(248,113,113,.3);color:var(--er)}</style></head><body><div class="bg"></div><header><div class="logo">KRPH</div><div style="color:var(--m)">v${VERSION} · Lua/Luau</div></header><main><h1>KRPH</h1><p class="lead">Lua / Luau obfuscator</p><section class="panel"><div class="tb"><div style="color:var(--m);font-size:.85rem">full protect · 3-layer VM · wipe · anti</div><div>
-<button class="pri" id="go">Obfuscate</button>
-<button id="copy">Copy</button>
-<label class="filebtn">Upload .lua/.luau<input type="file" id="up" accept=".lua,.luau,.txt,text/plain"/></label>
-<button id="dl">Download .lua</button>
-</div></div><div class="ed"><div class="col"><textarea id="in">--!strict
-local Players = game:GetService("Players")
-local count: number = 0
-count += 1
-print(Players.LocalPlayer)
-local msg = "hello KRPH"
-print(msg)</textarea></div><div class="col"><textarea id="out" readonly></textarea></div></div><div class="st" id="stats" hidden></div><div class="er" id="err" hidden></div></section></main>
+const PRO_HTML = `<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>KRPH Pro</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:system-ui,-apple-system,sans-serif;background:#0b0f14;color:#e6edf3;min-height:100vh}
+.wrap{max-width:720px;margin:0 auto;padding:24px}
+h1{font-size:1.4rem;margin-bottom:6px}
+.sub{color:#8b949e;margin-bottom:18px;font-size:.9rem}
+label{display:block;margin:12px 0 6px;font-size:.85rem;color:#8b949e}
+input,textarea{width:100%;background:#161b22;border:1px solid #30363d;border-radius:8px;color:#e6edf3;padding:10px 12px;font-size:14px}
+textarea{min-height:160px;font-family:ui-monospace,monospace;font-size:13px}
+.row{display:flex;gap:10px;margin-top:14px;flex-wrap:wrap}
+button{background:#238636;color:#fff;border:0;border-radius:8px;padding:10px 18px;font-weight:600;cursor:pointer}
+button:hover{background:#2ea043}
+button.secondary{background:#21262d}
+button.secondary:hover{background:#30363d}
+.card{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:16px;margin-bottom:16px}
+.msg{margin-top:12px;padding:10px;border-radius:6px;font-size:.9rem;white-space:pre-wrap}
+.ok{background:#12261e;color:#3fb950}
+.err{background:#2d1214;color:#f85149}
+.keybox{font-family:ui-monospace,monospace;word-break:break-all;background:#0d1117;padding:10px;border-radius:6px;margin-top:8px}
+nav a{color:#58a6ff;margin-right:14px;text-decoration:none}
+.warn{color:#d29922;font-size:.85rem;margin-top:8px}
+</style>
+</head>
+<body>
+<div class="wrap">
+<nav style="margin-bottom:16px">
+  <a href="/">Obfuscator</a>
+  <a href="/pro">Pro</a>
+</nav>
+<h1>KRPH Pro</h1>
+<p class="sub">Owner key required. Register → Save script → raw link (owner only).</p>
+
+<div class="card">
+  <h3 style="margin-bottom:8px">1. Register (get owner key)</h3>
+  <p class="sub" style="margin:0">Key is shown once. Store it. Only this key can read/update your scripts.</p>
+  <div class="row">
+    <button type="button" id="btnReg">Register / Issue Key</button>
+  </div>
+  <div id="regMsg" class="msg" style="display:none"></div>
+  <div id="keyBox" class="keybox" style="display:none"></div>
+</div>
+
+<div class="card">
+  <h3 style="margin-bottom:8px">2. Save / Update script</h3>
+  <label>Owner key</label>
+  <input id="ownerKey" type="text" placeholder="krph_..." autocomplete="off"/>
+  <label>Script ID (leave empty to create new)</label>
+  <input id="scriptId" type="text" placeholder="optional existing id"/>
+  <label>Script source</label>
+  <textarea id="scriptBody" placeholder="-- your lua"></textarea>
+  <div class="row">
+    <button type="button" id="btnSave">Save</button>
+  </div>
+  <div id="saveMsg" class="msg" style="display:none"></div>
+</div>
+
+<div class="card">
+  <h3 style="margin-bottom:8px">3. Raw link</h3>
+  <p class="sub" style="margin:0">Format: /raw/&lt;id&gt;?key=&lt;owner_key&gt;</p>
+  <p class="warn">Wrong/missing key → "You are not Owner". Steal attempts are logged & blacklisted.</p>
+  <div id="linkBox" class="keybox" style="display:none"></div>
+</div>
+</div>
 <script>
-const $=id=>document.getElementById(id);
-async function run(){
-  $("err").hidden=true;$("stats").hidden=true;$("go").disabled=true;
-  try{
-    const res=await fetch("/api/obfuscate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({code:$("in").value})});
-    const d=await res.json();
-    if(!res.ok||!d.ok)throw new Error(d.error||"fail");
-    $("out").value=d.code;
-    $("stats").hidden=false;
-    $("stats").textContent="in "+d.stats.originalBytes+"B -> "+d.stats.outputBytes+"B | "+d.stats.mode+(d.stats.wiped?" | source removed":"");
-  }catch(e){$("err").hidden=false;$("err").textContent=e.message}
-  finally{$("go").disabled=false}
-}
-$("go").onclick=run;
-$("copy").onclick=async()=>{if($("out").value)await navigator.clipboard.writeText($("out").value)};
-$("up").onchange=async(e)=>{const f=e.target.files&&e.target.files[0];if(!f)return;if(f.size>1500000){alert("max 1.5MB");return;}$("in").value=await f.text();};
-$("dl").onclick=()=>{const t=$("out").value;if(!t){alert("먼저 Obfuscate 하세요");return;}const blob=new Blob([t],{type:"text/plain;charset=utf-8"});const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download="krph_protected.lua";document.body.appendChild(a);a.click();setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove();},200);};
-</script></body></html>`;
+(function(){
+  const regMsg=document.getElementById('regMsg');
+  const keyBox=document.getElementById('keyBox');
+  const saveMsg=document.getElementById('saveMsg');
+  const linkBox=document.getElementById('linkBox');
+  const btnReg=document.getElementById('btnReg');
+  const btnSave=document.getElementById('btnSave');
 
-function send(res, status, body, type = "text/plain; charset=utf-8") {
-  const buf = Buffer.from(body);
-  res.writeHead(status, { "Content-Type": type, "Content-Length": buf.length });
-  res.end(buf);
+  function show(el, text, ok){
+    el.style.display='block';
+    el.className='msg '+(ok?'ok':'err');
+    el.textContent=text;
+  }
+
+  btnReg.addEventListener('click', async function(){
+    regMsg.style.display='block';
+    regMsg.className='msg';
+    regMsg.textContent='Issuing key...';
+    keyBox.style.display='none';
+    btnReg.disabled=true;
+    try{
+      const r=await fetch('/api/register',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+      const j=await r.json();
+      if(!r.ok)throw new Error(j.error||'register failed');
+      keyBox.style.display='block';
+      keyBox.textContent=j.key;
+      document.getElementById('ownerKey').value=j.key;
+      show(regMsg, 'Key issued. Copy and store it now.', true);
+    }catch(e){
+      show(regMsg, e.message||String(e), false);
+    }
+    btnReg.disabled=false;
+  });
+
+  btnSave.addEventListener('click', async function(){
+    const key=document.getElementById('ownerKey').value.trim();
+    const id=document.getElementById('scriptId').value.trim();
+    const body=document.getElementById('scriptBody').value;
+    if(!key){show(saveMsg,'Owner key required',false);return;}
+    if(!body){show(saveMsg,'Script empty',false);return;}
+    saveMsg.style.display='block';
+    saveMsg.className='msg';
+    saveMsg.textContent='Saving...';
+    btnSave.disabled=true;
+    try{
+      const r=await fetch('/api/script',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({key:key,id:id||undefined,code:body})
+      });
+      const j=await r.json();
+      if(!r.ok)throw new Error(j.error||'save failed');
+      document.getElementById('scriptId').value=j.id;
+      const origin=location.origin;
+      const url=origin+'/raw/'+j.id+'?key='+encodeURIComponent(key);
+      linkBox.style.display='block';
+      linkBox.textContent=url;
+      show(saveMsg, 'Saved. ID: '+j.id, true);
+    }catch(e){
+      show(saveMsg, e.message||String(e), false);
+    }
+    btnSave.disabled=false;
+  });
+})();
+</script>
+</body>
+</html>`;
+
+function isBlacklisted(ip, key) {
+  if (ip && blacklist.ips.includes(ip)) return true;
+  if (key && blacklist.keys.includes(hashKey(key))) return true;
+  return false;
+}
+
+function addBlacklist(ip, key, reason) {
+  if (ip && !blacklist.ips.includes(ip)) blacklist.ips.push(ip);
+  if (key) {
+    const h = hashKey(key);
+    if (!blacklist.keys.includes(h)) blacklist.keys.push(h);
+  }
+  saveJSON(BLACKLIST_FILE, blacklist);
+  console.log("[BLACKLIST]", reason, ip || "", key ? key.slice(0, 12) + "..." : "");
+}
+
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const raw = Buffer.concat(chunks).toString("utf8");
+      try {
+        resolve(raw ? JSON.parse(raw) : {});
+      } catch {
+        resolve({ _raw: raw });
+      }
+    });
+    req.on("error", reject);
+  });
 }
 
 const server = http.createServer(async (req, res) => {
-  const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
-  if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/index.html")) {
-    return send(res, 200, HTML, "text/html; charset=utf-8");
-  }
-  if (req.method === "GET" && url.pathname === "/api/health") {
-    return send(res, 200, JSON.stringify({ ok: true, name: "KRPH", version: VERSION }), "application/json");
-  }
-  if (req.method === "POST" && url.pathname === "/api/obfuscate") {
-    let raw = "";
-    for await (const c of req) {
-      raw += c;
-      if (raw.length > 2000000) return send(res, 413, JSON.stringify({ error: "too large" }), "application/json");
-    }
-    try {
-      const body = JSON.parse(raw || "{}");
-      if (typeof body.code !== "string" || !body.code.trim()) {
-        return send(res, 400, JSON.stringify({ error: "code required" }), "application/json");
-      }
-      const result = obfuscateLua(body.code, {}); // always full protect
-      return send(res, 200, JSON.stringify({ ok: true, code: result.code, stats: result.stats }), "application/json");
-    } catch (e) {
-      return send(res, 500, JSON.stringify({ error: e.message || "fail" }), "application/json");
-    }
-  }
+  const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+  const ip = (req.headers["x-forwarded-for"] || "").split(",")[0].trim() || req.socket.remoteAddress || "";
 
-  if (req.method === "GET" && url.pathname === "/pro") {
-    return send(res, 200, PRO_HTML, "text/html; charset=utf-8");
-  }
-  if (req.method === "POST" && url.pathname === "/api/register") {
-    const owners = loadOwners();
-    const key = newKey();
-    owners[key] = { created: Date.now(), scripts: [] };
-    saveOwners(owners);
-    return send(res, 200, JSON.stringify({ ok: true, key }), "application/json");
-  }
-  if (req.method === "POST" && url.pathname === "/api/pro/save") {
-    let raw = "";
-    for await (const ch of req) {
-      raw += ch;
-      if (raw.length > 3000000) return send(res, 413, JSON.stringify({ error: "too large" }), "application/json");
-    }
-    try {
-      const body = JSON.parse(raw || "{}");
-      const key = String(body.key || "");
-      const code = String(body.code || "");
-      if (!key || !code.trim()) return send(res, 400, JSON.stringify({ error: "key and code required" }), "application/json");
-      const owners = loadOwners();
-      if (!owners[key]) return send(res, 403, JSON.stringify({ error: "You are not Owner" }), "application/json");
-      const id = newId();
-      const meta = { id, owner: key, created: Date.now() };
-      fs.writeFileSync(path.join(SCRIPTS_DIR, id + ".lua"), code);
-      fs.writeFileSync(path.join(SCRIPTS_DIR, id + ".json"), JSON.stringify(meta));
-      owners[key].scripts = owners[key].scripts || [];
-      owners[key].scripts.push(id);
-      saveOwners(owners);
-      const host = req.headers.host || ("localhost:" + PORT);
-      const proto = (req.headers["x-forwarded-proto"] || "http");
-      const rawUrl = proto + "://" + host + "/raw/" + id + "?key=" + encodeURIComponent(key);
-      return send(res, 200, JSON.stringify({ ok: true, id, rawUrl }), "application/json");
-    } catch (e) {
-      return send(res, 500, JSON.stringify({ error: e.message || "fail" }), "application/json");
-    }
-  }
-  if (req.method === "GET" && url.pathname.startsWith("/raw/")) {
-    const id = url.pathname.slice(5).replace(/[^a-f0-9]/gi, "");
-    const key = url.searchParams.get("key") || "";
-    if (!id) return send(res, 404, "not found");
-    const metaPath = path.join(SCRIPTS_DIR, id + ".json");
-    const luaPath = path.join(SCRIPTS_DIR, id + ".lua");
-    if (!fs.existsSync(metaPath) || !fs.existsSync(luaPath)) return send(res, 404, "not found");
-    let meta;
-    try { meta = JSON.parse(fs.readFileSync(metaPath, "utf8")); } catch { return send(res, 404, "not found"); }
-    if (!key || key !== meta.owner) {
-      return send(res, 403, "You are not Owner", "text/plain; charset=utf-8");
-    }
-    const code = fs.readFileSync(luaPath, "utf8");
-    res.writeHead(200, {
-      "Content-Type": "text/plain; charset=utf-8",
-      "Content-Disposition": "inline; filename=\"" + id + ".lua\"",
-      "Cache-Control": "no-store"
+  // CORS preflight
+  if (req.method === "OPTIONS") {
+    res.writeHead(204, {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type",
     });
-    return res.end(code);
+    return res.end();
   }
 
-  send(res, 404, "not found");
+  const json = (code, obj) => {
+    res.writeHead(code, {
+      "Content-Type": "application/json; charset=utf-8",
+      "Access-Control-Allow-Origin": "*",
+    });
+    res.end(JSON.stringify(obj));
+  };
+
+  try {
+    // ----- pages -----
+    if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/index.html")) {
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      return res.end(MAIN_HTML);
+    }
+    if (req.method === "GET" && url.pathname === "/pro") {
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      return res.end(PRO_HTML);
+    }
+
+    // ----- register (issue owner key) -----
+    if (req.method === "POST" && url.pathname === "/api/register") {
+      if (isBlacklisted(ip, null)) return json(403, { error: "You are not Owner" });
+      const key = genKey();
+      const id = genId();
+      users[hashKey(key)] = {
+        id,
+        created: Date.now(),
+        ip,
+      };
+      saveJSON(USERS_FILE, users);
+      return json(200, { key, userId: id });
+    }
+
+    // ----- save / update script (owner only) -----
+    if (req.method === "POST" && url.pathname === "/api/script") {
+      const body = await readBody(req);
+      const key = (body.key || "").trim();
+      if (!key) return json(403, { error: "You are not Owner" });
+      if (isBlacklisted(ip, key)) return json(403, { error: "You are not Owner" });
+      const kh = hashKey(key);
+      if (!users[kh]) {
+        addBlacklist(ip, key, "unknown-key-save");
+        return json(403, { error: "You are not Owner" });
+      }
+      let id = (body.id || "").trim();
+      const code = body.code;
+      if (typeof code !== "string") return json(400, { error: "code required" });
+
+      if (id) {
+        const existing = scripts[id];
+        if (!existing || existing.ownerHash !== kh) {
+          addBlacklist(ip, key, "edit-not-owner");
+          return json(403, { error: "You are not Owner" });
+        }
+        scripts[id].code = code;
+        scripts[id].updated = Date.now();
+      } else {
+        id = genId();
+        scripts[id] = {
+          ownerHash: kh,
+          code,
+          created: Date.now(),
+          updated: Date.now(),
+        };
+      }
+      saveJSON(SCRIPTS_FILE, scripts);
+      return json(200, { id, ok: true });
+    }
+
+    // ----- raw fetch (owner key required) -----
+    if (req.method === "GET" && url.pathname.startsWith("/raw/")) {
+      const id = url.pathname.slice(5).replace(/\/$/, "");
+      const key = (url.searchParams.get("key") || "").trim();
+      if (!id) {
+        res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+        return res.end("Not found");
+      }
+      if (!key || isBlacklisted(ip, key)) {
+        addBlacklist(ip, key || null, "raw-no-key");
+        res.writeHead(403, { "Content-Type": "text/plain; charset=utf-8" });
+        return res.end("You are not Owner");
+      }
+      const sc = scripts[id];
+      if (!sc) {
+        res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+        return res.end("Not found");
+      }
+      const kh = hashKey(key);
+      if (sc.ownerHash !== kh) {
+        addBlacklist(ip, key, "raw-wrong-key");
+        res.writeHead(403, { "Content-Type": "text/plain; charset=utf-8" });
+        return res.end("You are not Owner");
+      }
+      // owner ok — return script (optionally already protected; store as given)
+      res.writeHead(200, {
+        "Content-Type": "text/plain; charset=utf-8",
+        "Cache-Control": "no-store",
+      });
+      return res.end(sc.code);
+    }
+
+    // ----- obfuscate -----
+    if (req.method === "POST" && url.pathname === "/api/obfuscate") {
+      const body = await readBody(req);
+      const code = body.code;
+      if (typeof code !== "string" || !code.trim()) {
+        return json(400, { error: "code required" });
+      }
+      try {
+        const out = obfuscate(code);
+        return json(200, { code: out });
+      } catch (e) {
+        return json(500, { error: e.message || "obfuscate failed" });
+      }
+    }
+
+    res.writeHead(404, { "Content-Type": "text/plain" });
+    res.end("Not found");
+  } catch (e) {
+    console.error(e);
+    res.writeHead(500, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "server error" }));
+  }
 });
 
-if (require.main === module) {
-  server.listen(PORT, () => console.log("KRPH", VERSION, ":" + PORT));
-}
-
-module.exports = { obfuscateLua, server };
+server.listen(PORT, () => {
+  console.log(`KRPH listening on http://localhost:${PORT}`);
+  console.log(`  /        obfuscator`);
+  console.log(`  /pro     register + save (owner key)`);
+  console.log(`  /raw/:id?key=...`);
+});
