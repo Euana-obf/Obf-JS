@@ -446,9 +446,9 @@ nav a{color:#58a6ff;margin-right:14px;text-decoration:none}
 </div>
 
 <div class="card">
-  <h3 style="margin-bottom:8px">3. Raw link</h3>
-  <p class="sub" style="margin:0">Format: /raw/&lt;id&gt;?key=&lt;owner_key&gt;</p>
-  <p class="warn">Wrong/missing key → "You are not Owner". Steal attempts are logged & blacklisted.</p>
+  <h3 style="margin-bottom:8px">3. Run (Luarmor style)</h3>
+  <p class="sub" style="margin:0">Copy this into your executor after Save:</p>
+  <p class="warn">Wrong/missing key → You are not Owner. Script ID = any name you want.</p>
   <div id="linkBox" class="keybox" style="display:none"></div>
 </div>
 </div>
@@ -508,8 +508,9 @@ nav a{color:#58a6ff;margin-right:14px;text-decoration:none}
       document.getElementById('scriptId').value=j.id;
       const origin=location.origin;
       const url=origin+'/raw/'+j.id+'?key='+encodeURIComponent(key);
+      const loader='loadstring(game:HttpGet("'+url+'"))()';
       linkBox.style.display='block';
-      linkBox.textContent=url;
+      linkBox.textContent=loader;
       show(saveMsg, 'Saved. ID: '+j.id, true);
     }catch(e){
       show(saveMsg, e.message||String(e), false);
@@ -588,7 +589,7 @@ const server = http.createServer(async (req, res) => {
 
     // ----- register (issue owner key) -----
     if (req.method === "POST" && url.pathname === "/api/register") {
-      if (isBlacklisted(ip, null)) return json(403, { error: "You are not Owner" });
+      // allow register even if IP was flagged; only block repeated abuse keys
       const key = genKey();
       const id = genId();
       users[hashKey(key)] = {
@@ -605,24 +606,42 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req);
       const key = (body.key || "").trim();
       if (!key) return json(403, { error: "You are not Owner" });
-      if (isBlacklisted(ip, key)) return json(403, { error: "You are not Owner" });
+      // valid registered key is never treated as blacklisted for save
       const kh = hashKey(key);
       if (!users[kh]) {
+        if (isBlacklisted(ip, key)) return json(403, { error: "You are not Owner" });
         addBlacklist(ip, key, "unknown-key-save");
         return json(403, { error: "You are not Owner" });
       }
+      // un-blacklist registered owner on successful auth
+      blacklist.ips = blacklist.ips.filter((x) => x !== ip);
+      blacklist.keys = blacklist.keys.filter((x) => x !== kh);
+      saveJSON(BLACKLIST_FILE, blacklist);
+
       let id = (body.id || "").trim();
       const code = body.code;
       if (typeof code !== "string") return json(400, { error: "code required" });
 
+      // allow custom id: a-z A-Z 0-9 _ - only
       if (id) {
-        const existing = scripts[id];
-        if (!existing || existing.ownerHash !== kh) {
-          addBlacklist(ip, key, "edit-not-owner");
-          return json(403, { error: "You are not Owner" });
+        if (!/^[A-Za-z0-9_-]{1,64}$/.test(id)) {
+          return json(400, { error: "Script ID must be 1-64 chars: A-Z a-z 0-9 _ -" });
         }
-        scripts[id].code = code;
-        scripts[id].updated = Date.now();
+        const existing = scripts[id];
+        if (existing) {
+          if (existing.ownerHash !== kh) {
+            return json(403, { error: "Script ID already taken" });
+          }
+          scripts[id].code = code;
+          scripts[id].updated = Date.now();
+        } else {
+          scripts[id] = {
+            ownerHash: kh,
+            code,
+            created: Date.now(),
+            updated: Date.now(),
+          };
+        }
       } else {
         id = genId();
         scripts[id] = {
@@ -636,16 +655,26 @@ const server = http.createServer(async (req, res) => {
       return json(200, { id, ok: true });
     }
 
-    // ----- raw fetch (owner key required) -----
+    // ----- raw / loader fetch (owner key required) -----
+    // /raw/:id  or  /files/v4/loaders/:id.lua  (Luarmor-style path)
+    let rawId = null;
     if (req.method === "GET" && url.pathname.startsWith("/raw/")) {
-      const id = url.pathname.slice(5).replace(/\/$/, "");
+      rawId = url.pathname.slice(5).replace(/\/$/, "").replace(/\.lua$/i, "");
+    } else if (req.method === "GET" && url.pathname.startsWith("/files/v4/loaders/")) {
+      rawId = url.pathname.slice("/files/v4/loaders/".length).replace(/\/$/, "").replace(/\.lua$/i, "");
+    }
+    if (rawId !== null) {
+      const id = rawId;
       const key = (url.searchParams.get("key") || "").trim();
       if (!id) {
         res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
         return res.end("Not found");
       }
-      if (!key || isBlacklisted(ip, key)) {
-        addBlacklist(ip, key || null, "raw-no-key");
+      if (!key) {
+        res.writeHead(403, { "Content-Type": "text/plain; charset=utf-8" });
+        return res.end("You are not Owner");
+      }
+      if (isBlacklisted(ip, key)) {
         res.writeHead(403, { "Content-Type": "text/plain; charset=utf-8" });
         return res.end("You are not Owner");
       }
@@ -660,10 +689,10 @@ const server = http.createServer(async (req, res) => {
         res.writeHead(403, { "Content-Type": "text/plain; charset=utf-8" });
         return res.end("You are not Owner");
       }
-      // owner ok — return script (optionally already protected; store as given)
       res.writeHead(200, {
         "Content-Type": "text/plain; charset=utf-8",
         "Cache-Control": "no-store",
+        "Access-Control-Allow-Origin": "*",
       });
       return res.end(sc.code);
     }
